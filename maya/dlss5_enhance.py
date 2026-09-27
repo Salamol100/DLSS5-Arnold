@@ -123,10 +123,16 @@ def exr_channels(exr):
 STYLES = ["Default", "Natural", "Cinematic"]
 
 
-def write_settings(intensity, structure, style=None):
+def write_settings(intensity, structure, style=None, skin_structure=None):
+    """skin_structure: RenoDX's separate NRSkinStructure. Confirmed on a real face (tools/facesweep):
+    behaves the opposite way to NRLocalStructure - LOWER values give more raw, blotchy, pore-visible
+    skin; HIGHER values (the RenoDX default, ~2) smooth/idealise it. Not the same axis as Structure,
+    which plateaus by 2 and mostly affects hard-surface fine detail."""
     vals = {"NeuralUplift": "1", "NRIntensity": "%g" % intensity, "NRLocalStructure": "%g" % structure}
     if style is not None:
         vals["NRStyle"] = str(STYLES.index(style))
+    if skin_structure is not None:
+        vals["NRSkinStructure"] = "%g" % skin_structure
     with open(INI, "r") as f:
         lines = f.read().splitlines()
     out = []
@@ -147,7 +153,8 @@ def read_settings():
                     vals[k] = v
     except IOError:
         pass
-    return float(vals.get("NRIntensity", 0.5)), float(vals.get("NRLocalStructure", 2.0))
+    return (float(vals.get("NRIntensity", 0.5)), float(vals.get("NRLocalStructure", 2.0)),
+            float(vals.get("NRSkinStructure", 2.0)))
 
 
 def read_style():
@@ -741,7 +748,7 @@ def _write_sidecar(shown, frame, **settings):
     try:
         path = os.path.splitext(shown)[0] + ".json"
         settings["frame"] = frame
-        settings["intensity"], settings["structure"] = read_settings()
+        settings["intensity"], settings["structure"], settings["skin_structure"] = read_settings()
         settings["style"] = read_style()
         settings["written"] = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(path, "w") as f:
@@ -1168,7 +1175,7 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
                          keep_original=True, log=print, done=None, block=False, style=None,
                          motion_vectors=None, stabilise=0.8, hdr=True, debug=False, passes=1, exposure=0.0,
                          mode="full", detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True,
-                         live_preview=None, aces_compress=False, tag_filename=False):
+                         live_preview=None, aces_compress=False, tag_filename=False, skin_structure=None):
     """Render frames start..end of the open scene with Arnold, then DLSS 5 them in order.
     motion_vectors: None = automatic (on for ranges, off for a single frame).
     stabilise: 0 = off, else strength of the motion-vector stabilisation of the DLSS edit
@@ -1182,7 +1189,7 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
     each other and are tellable apart in a file listing. Off by default: unchanged behaviour."""
     if live_preview is None:
         live_preview = (end == start)
-    write_settings(intensity, structure, style)
+    write_settings(intensity, structure, style, skin_structure)
     fmt = _resolve_fmt(fmt, end - start + 1)
     space, aces = colour_setup()
     use_mv = (end > start) if motion_vectors is None else bool(motion_vectors)
@@ -1224,13 +1231,13 @@ def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, 
                          allow_flat_depth=False, keep_original=True, log=print, done=None, block=False,
                          style=None, hdr=True, debug=False, passes=1, exposure=0.0, mode="full",
                          detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True,
-                         aces_compress=False, tag_filename=False):
+                         aces_compress=False, tag_filename=False, skin_structure=None):
     """DLSS 5 an already-rendered EXR sequence: list of (frame, path). The EXRs are assumed to be
     in the scene's rendering space (ACEScg with Maya's default colour management).
     dof_aware has no effect here: there's no live camera tied to an already-rendered sequence, so
     there's nothing safe to read a focus distance from.
     tag_filename: see process_scene_frames."""
-    write_settings(intensity, structure, style)
+    write_settings(intensity, structure, style, skin_structure)
     fmt = _resolve_fmt(fmt, len(exrs))
     space, aces = colour_setup()
     work = _new_work()
@@ -1293,10 +1300,11 @@ def _settings_tag(intensity, structure, passes, look, detail_amount, style):
 
 DEFAULTS = dict(intensity=0.98, structure=2.0, style="Default", passes=1, look=0.0,
                 detail_amount=1.0, detail_size=3.0, exposure=0.0, dof_aware=True, hdr=True,
-                aces_compress=False)
+                aces_compress=False, skin_structure=2.0)
 PRESETS = {
     "Default (safe)":       {},
     "Subtle":               dict(detail_amount=0.6),
+    "Faces - raw skin":     dict(skin_structure=0.0),
     "Faces - photoreal":    dict(passes=2, look=0.5, detail_amount=1.5),
     "Surfaces - crisp":     dict(detail_amount=1.8, detail_size=1.5),
     "Full DLSS 5 look":     dict(look=1.0),
@@ -1388,7 +1396,7 @@ _UI_CTRLS = dict(intensity=("_int", "floatSliderGrp"), structure=("_str", "float
                  exposure=("_exp", "floatSliderGrp"), look=("_look", "floatSliderGrp"),
                  detail_amount=("_damt", "floatSliderGrp"), detail_size=("_dsz", "floatSliderGrp"),
                  dof_aware=("_dof", "checkBox"), hdr=("_hdrin", "checkBox"),
-                 aces_compress=("_cmp", "checkBox"))
+                 aces_compress=("_cmp", "checkBox"), skin_structure=("_skin", "floatSliderGrp"))
 
 
 def _ui_settings():
@@ -1643,6 +1651,12 @@ def show():
                         value=s["structure"], precision=2, columnWidth3=(80, 50, 280),
                         annotation="Fine-detail strength of the neural pass (RenoDX Structure Intensity): contact "
                                    "shadows, micro detail, SSS. 2 = maximum; higher values are ignored.")
+    cmds.floatSliderGrp(WIN + "_skin", label="Skin structure", field=True, minValue=0.0, maxValue=3.0,
+                        value=s["skin_structure"], precision=2, columnWidth3=(80, 50, 280),
+                        annotation="RenoDX's separate skin-only control (NRSkinStructure) - not the same axis as "
+                                   "Structure above. Runs the OPPOSITE way (measured on a real face): LOWER gives "
+                                   "more raw, blotchy, pore-visible skin; HIGHER (2, the default) smooths/idealises "
+                                   "it. Values above ~2 don't push further. 0 for raw/photoreal skin texture.")
     cmds.intSliderGrp(WIN + "_pas", label="Passes", field=True, minValue=1, maxValue=3, value=s["passes"],
                       columnWidth3=(80, 50, 280),
                       annotation="Run DLSS 5 again on its own output. 1 = normal, 2 = strong photoreal (sweet spot "
