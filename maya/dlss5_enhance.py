@@ -1161,13 +1161,14 @@ def _opt(name, default):
 
 # Safe defaults: Arnold look kept, DLSS detail added once. "Reset" always returns here.
 DEFAULTS = dict(intensity=0.98, structure=2.0, style="Default", passes=1, look=0.0,
-                detail_amount=1.0, detail_size=3.0, exposure=0.0, dof_aware=True)
+                detail_amount=1.0, detail_size=3.0, exposure=0.0, dof_aware=True, hdr=True)
 PRESETS = {
     "Default (safe)":       {},
     "Subtle":               dict(detail_amount=0.6),
     "Faces - photoreal":    dict(passes=2, look=0.5, detail_amount=1.5),
     "Surfaces - crisp":     dict(detail_amount=1.8, detail_size=1.5),
     "Full DLSS 5 look":     dict(look=1.0),
+    "Environments / props": dict(hdr=False),
 }
 _SETTINGS_VAR, _USER_PRESETS_VAR = "dlss5_settings", "dlss5_userPresets"
 
@@ -1254,7 +1255,7 @@ _UI_CTRLS = dict(intensity=("_int", "floatSliderGrp"), structure=("_str", "float
                  style=("_sty", "optionMenuGrp"), passes=("_pas", "intSliderGrp"),
                  exposure=("_exp", "floatSliderGrp"), look=("_look", "floatSliderGrp"),
                  detail_amount=("_damt", "floatSliderGrp"), detail_size=("_dsz", "floatSliderGrp"),
-                 dof_aware=("_dof", "checkBox"))
+                 dof_aware=("_dof", "checkBox"), hdr=("_hdrin", "checkBox"))
 
 
 def _ui_settings():
@@ -1558,6 +1559,16 @@ def show():
                              "Arnold's own pixels wherever a pixel is out of focus, feathered so there's "
                              "no visible seam. Does nothing if the camera has no depth of field. Turn "
                              "off only to compare against raw DLSS 5.")
+    cmds.checkBox(WIN + "_hdrin", label="Linear HDR input (uncheck for environments/props)",
+                  value=s["hdr"],
+                  annotation="DLSS 5 was trained on tonemapped game frames, not raw scene-linear render "
+                             "passes. On, it feeds DLSS 5 Arnold's true scene-linear ACEScg values (16-bit "
+                             "float, no precision loss) - this is what the Faces presets were tuned and "
+                             "tested on. Off, it feeds DLSS 5 the already view-transformed (tonemapped) "
+                             "image instead, which matches DLSS 5's training data far better on "
+                             "environments/props: measured on a reef background, On crushed the shadows "
+                             "and darkened the whole image ~44%; Off matched Arnold's own brightness and "
+                             "shadow level almost exactly. Try Off first on anything that isn't a face.")
     _ui_fill_presets()
     for c, fn in _UI_CTRLS.values():
         getattr(cmds, fn)(WIN + c, e=True, changeCommand=_ui_changed)
