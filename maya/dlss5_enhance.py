@@ -1168,7 +1168,7 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
                          keep_original=True, log=print, done=None, block=False, style=None,
                          motion_vectors=None, stabilise=0.8, hdr=True, debug=False, passes=1, exposure=0.0,
                          mode="full", detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True,
-                         live_preview=None, aces_compress=False):
+                         live_preview=None, aces_compress=False, tag_filename=False):
     """Render frames start..end of the open scene with Arnold, then DLSS 5 them in order.
     motion_vectors: None = automatic (on for ranges, off for a single frame).
     stabilise: 0 = off, else strength of the motion-vector stabilisation of the DLSS edit
@@ -1176,7 +1176,10 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
     fmt: 'auto' (PNG 16-bit for one frame, EXR for ranges), 'exr', 'png16', 'png8'.
     live_preview: show Arnold's own progressive render window while it renders. None (default) =
     automatic: on for a single frame, off for a range (a popping-up window per frame would be more
-    annoying than useful over a sequence)."""
+    annoying than useful over a sequence).
+    tag_filename: work the main sliders (Strength/Structure/Passes/Look/Detail/Style) into the output
+    filename (see _settings_tag), so renders of the same frame at different settings don't overwrite
+    each other and are tellable apart in a file listing. Off by default: unchanged behaviour."""
     if live_preview is None:
         live_preview = (end == start)
     write_settings(intensity, structure, style)
@@ -1190,6 +1193,9 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
         log("Depth of field: %s" % ("protecting out-of-focus areas from DLSS 5" if dof is not None
                                      else "camera has no depth of field - nothing to protect"))
     name = os.path.splitext(os.path.basename(cmds.file(q=True, sn=True) or "untitled"))[0] or "untitled"
+    if tag_filename:
+        name += "_" + _settings_tag(intensity, structure, passes, look, detail_amount,
+                                    style or read_style())
     _start(_run_pipeline, dict(frames=frames, out_dir=out_dir, name=name, fmt=fmt, near=near, work=work,
                                allow_flat_depth=False, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=True, use_mv=use_mv,
@@ -1218,16 +1224,19 @@ def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, 
                          allow_flat_depth=False, keep_original=True, log=print, done=None, block=False,
                          style=None, hdr=True, debug=False, passes=1, exposure=0.0, mode="full",
                          detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True,
-                         aces_compress=False):
+                         aces_compress=False, tag_filename=False):
     """DLSS 5 an already-rendered EXR sequence: list of (frame, path). The EXRs are assumed to be
     in the scene's rendering space (ACEScg with Maya's default colour management).
     dof_aware has no effect here: there's no live camera tied to an already-rendered sequence, so
-    there's nothing safe to read a focus distance from."""
+    there's nothing safe to read a focus distance from.
+    tag_filename: see process_scene_frames."""
     write_settings(intensity, structure, style)
     fmt = _resolve_fmt(fmt, len(exrs))
     space, aces = colour_setup()
     work = _new_work()
     name = re.sub(r"[._]+$", "", re.sub(r"\d+\.exr$", "", os.path.basename(exrs[0][1]), flags=re.I)) or "seq"
+    if tag_filename:
+        name += "_" + _settings_tag(intensity, structure, passes, look, detail_amount, style or read_style())
     frames = [(f, None, p, None) for f, p in exrs]
     _start(_run_pipeline, dict(frames=frames, out_dir=out_dir, name=name, fmt=fmt, near=near, work=work,
                                allow_flat_depth=allow_flat_depth, keep_original=keep_original, log=log,
@@ -1273,6 +1282,15 @@ def _opt(name, default):
 
 
 # Safe defaults: Arnold look kept, DLSS detail added once. "Reset" always returns here.
+def _settings_tag(intensity, structure, passes, look, detail_amount, style):
+    """Short, filesystem-safe summary of the sliders that most often change between renders, for
+    the filename when 'Tag filename with settings' is on - so you can tell renders apart in a file
+    listing without opening anything. Exposure/DOF-aware/Linear HDR input/Compress before DLSS are
+    left out to keep it short; they're always in the .json sidecar next to every render."""
+    return "S%g_St%g_P%d_L%g_D%g_%s" % (intensity, structure, passes, look, detail_amount,
+                                        re.sub(r"[^A-Za-z0-9]", "", style) or "Default")
+
+
 DEFAULTS = dict(intensity=0.98, structure=2.0, style="Default", passes=1, look=0.0,
                 detail_amount=1.0, detail_size=3.0, exposure=0.0, dof_aware=True, hdr=True,
                 aces_compress=False)
@@ -1444,6 +1462,7 @@ def _ui_vals():
         fmt=_UI_FORMATS[cmds.optionMenuGrp(WIN + "_fmt", q=True, value=True)],
         keep_original=cmds.checkBox(WIN + "_orig", q=True, value=True),
         debug=cmds.checkBox(WIN + "_dbg", q=True, value=True),
+        tag_filename=cmds.checkBox(WIN + "_tag", q=True, value=True),
     )
 
 
@@ -1536,7 +1555,7 @@ def quick_frame():
     f = int(cmds.currentTime(q=True))
     try:
         process_scene_frames(f, f, default_out_dir(), mode="full", log=_shelf_log, done=_shelf_done,
-                             **load_settings())
+                             tag_filename=bool(_opt("dlss5_tagFilename", 0)), **load_settings())
     except Exception as e:
         _state["busy"] = False
         cmds.warning("DLSS 5: %s" % e)
@@ -1563,7 +1582,8 @@ def quick_sequence():
     _shelf_log("sequence of %d frame(s) %d-%d" % (len(seq), seq[0][0], seq[-1][0]))
     try:
         process_exr_sequence(seq, default_out_dir(), near=near, allow_flat_depth=not has_z, mode="full",
-                             log=_shelf_log, done=_shelf_done, **load_settings())
+                             log=_shelf_log, done=_shelf_done,
+                             tag_filename=bool(_opt("dlss5_tagFilename", 0)), **load_settings())
     except Exception as e:
         _state["busy"] = False
         cmds.warning("DLSS 5: %s" % e)
@@ -1666,6 +1686,14 @@ def show():
     cmds.checkBox(WIN + "_dbg", label="Save debug images (compare, change map, DLSS inputs) in output/debug", value=False,
                   annotation="Per frame: compare = original | DLSS 5; diff = where DLSS 5 changed things locally "
                              "(heat map); inputs = what DLSS 5 received (colour | depth | motion vectors).")
+    cmds.checkBox(WIN + "_tag", label="Tag filename with settings (Strength/Structure/Passes/Look/Detail/Style)",
+                  value=bool(_opt("dlss5_tagFilename", 0)),
+                  changeCommand=lambda v: cmds.optionVar(intValue=("dlss5_tagFilename", int(bool(v)))),
+                  annotation="Works the main sliders into the output filename, e.g. "
+                             "'shot_S0.98_St2_P2_L0.37_D1_Cinematic_dlss5.0045.png', so renders of the "
+                             "same frame at different settings don't overwrite each other and are "
+                             "tellable apart in a file listing at a glance. Every render also always "
+                             "gets a full .json sidecar with every setting, tagged or not.")
     cmds.checkBox(WIN + "_dof", label="Keep out-of-focus areas as Arnold's own render (recommended)",
                   value=s["dof_aware"],
                   annotation="DLSS 5 posterises smooth depth-of-field blur into flat, cel-shaded patches "
