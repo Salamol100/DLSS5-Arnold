@@ -485,11 +485,12 @@ def _restore_gamut(orig_scrgb, dlss_scrgb):
     return dlss_scrgb + (neg_in - neg_out) * (neg_out > neg_in)
 
 
-def _write_outputs(img_scrgb, frame, name, out_dir, work, fmt, space, aces, log):
-    """scRGB result -> requested format (+ 8-bit preview for EXR). Returns the path to show."""
+def _write_outputs(img_scrgb, frame, name, out_dir, work, fmt, space, aces, log, exposure=0.0):
+    """scRGB result -> requested format (+ 8-bit preview for EXR). Returns the path to show.
+    exposure: stops applied to the output (scene-linear, before the view), not to the DLSS input."""
     import numpy as np
     oiio = os.path.join(arnold_bin(), "oiiotool.exe")
-    lin709 = img_scrgb / SCRGB_WHITE
+    lin709 = img_scrgb / SCRGB_WHITE * (2.0 ** exposure)
     ext, depth = FORMATS[fmt]
     dst = os.path.join(out_dir, "%s_dlss5.%04d.%s" % (name, frame, ext))
     tmp = os.path.join(work, "f%04d_final.pfm" % frame)
@@ -567,7 +568,7 @@ def _write_debug(frame, name, out_dir, work, orig_view, dlss_view, depth_path, m
 
 def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep_original,
                   log, done, render_scene, use_mv=False, stabilise=0.0, hdr=True, space="ACEScg",
-                  aces=True, debug=False, passes=1):
+                  aces=True, debug=False, passes=1, exposure=0.0):
     """frames: list of (frame, ass_or_None, exr, display_png_or_None).
     Runs kick (if ass), PFM, host, output. use_mv: pass Arnold's motionvector AOV (as exported by
     export_scene_frames(motion_vectors=True)) to DLSS 5. hdr: run DLSS 5 on a 16-bit float scRGB
@@ -666,7 +667,7 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
                 img = dl
             tmp = os.path.join(work, "f%04d_final.pfm" % frame)
             if hdr:
-                shown = _write_outputs(img, frame, name, out_dir, work, fmt, space, aces, log)
+                shown = _write_outputs(img, frame, name, out_dir, work, fmt, space, aces, log, exposure)
             else:
                 ext, depth = FORMATS.get(fmt, ("png", "uint8"))
                 if ext == "exr":
@@ -677,8 +678,9 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
                     raise RuntimeError("Could not write " + shown)
             if debug:
                 if hdr:
-                    ov = _view(orig_in / SCRGB_WHITE, aces)
-                    dv = _view(img / SCRGB_WHITE, aces)
+                    gain = 2.0 ** exposure  # same exposure on both sides of the comparison
+                    ov = _view(orig_in / SCRGB_WHITE * gain, aces)
+                    dv = _view(img / SCRGB_WHITE * gain, aces)
                 else:
                     ov, dv = _read_pfm(j["c"]), img
                 _write_debug(frame, name, out_dir, work, ov, dv, j["z"], j["mv"], log)
@@ -869,7 +871,7 @@ def _resolve_fmt(fmt, n_frames):
 
 def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt="auto",
                          keep_original=True, log=print, done=None, block=False, style=None,
-                         motion_vectors=None, stabilise=0.8, hdr=True, debug=False, passes=1):
+                         motion_vectors=None, stabilise=0.8, hdr=True, debug=False, passes=1, exposure=0.0):
     """Render frames start..end of the open scene with Arnold, then DLSS 5 them in order.
     motion_vectors: None = automatic (on for ranges, off for a single frame).
     stabilise: 0 = off, else strength of the motion-vector stabilisation of the DLSS edit
@@ -887,7 +889,7 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
                                allow_flat_depth=False, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=True, use_mv=use_mv,
                                stabilise=stabilise, hdr=hdr, space=space, aces=aces, debug=debug,
-                               passes=passes), block)
+                               passes=passes, exposure=exposure), block)
 
 
 def find_sequence(one_file):
@@ -907,7 +909,7 @@ def find_sequence(one_file):
 
 def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, fmt="auto",
                          allow_flat_depth=False, keep_original=True, log=print, done=None, block=False,
-                         style=None, hdr=True, debug=False, passes=1):
+                         style=None, hdr=True, debug=False, passes=1, exposure=0.0):
     """DLSS 5 an already-rendered EXR sequence: list of (frame, path). The EXRs are assumed to be
     in the scene's rendering space (ACEScg with Maya's default colour management)."""
     write_settings(intensity, structure, style)
@@ -919,7 +921,7 @@ def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, 
     _start(_run_pipeline, dict(frames=frames, out_dir=out_dir, name=name, fmt=fmt, near=near, work=work,
                                allow_flat_depth=allow_flat_depth, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=False, hdr=hdr,
-                               space=space, aces=aces, debug=debug, passes=passes), block)
+                               space=space, aces=aces, debug=debug, passes=passes, exposure=exposure), block)
 
 
 def cancel():
@@ -973,6 +975,7 @@ def _ui_vals():
         keep_original=cmds.checkBox(WIN + "_orig", q=True, value=True),
         debug=cmds.checkBox(WIN + "_dbg", q=True, value=True),
         passes=cmds.intSliderGrp(WIN + "_pas", q=True, value=True),
+        exposure=cmds.floatSliderGrp(WIN + "_exp", q=True, value=True),
     )
 
 
@@ -1141,6 +1144,10 @@ def show():
                       columnWidth3=(80, 50, 280),
                       annotation="Run DLSS 5 again on its own output. 1 = normal, 2 = strong photoreal (sweet spot "
                                  "on faces), 3 = overcooked: faces age and drift, environments soften more")
+    cmds.floatSliderGrp(WIN + "_exp", label="Exposure", field=True, minValue=-2.0, maxValue=2.0, value=0.0,
+                        precision=2, columnWidth3=(80, 50, 280),
+                        annotation="Stops applied to the DLSS 5 output (EXR and PNG), after the DLSS pass. "
+                                   "The saved original is not changed.")
     cmds.optionMenuGrp(WIN + "_sty", label="Style", columnWidth2=(80, 100))
     for s in STYLES:
         cmds.menuItem(label=s)

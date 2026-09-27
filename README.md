@@ -2,10 +2,17 @@
 
 **DLSS 5 neural rendering for Arnold renders in Maya 2024**
 
-![Arnold render (left) vs DLSS 5 neural rendering (right)](Docs/images/before_after.png)
-![Face close-up: Arnold (left) vs DLSS 5 (right)](Docs/images/before_after_face.png)
+![Arnold render (left) vs DLSS 5 neural rendering (right)](Docs/images/hero_face.png)
 
-*Left: Arnold render. Right: the same frame after DLSS 5 neural rendering (strength 0.98), same resolution.*
+*Left: Arnold render. Right: the same frame after DLSS 5 neural rendering (strength 0.98, 2 passes, +0.75 exposure), same resolution.*
+
+**Passes:** original, then 1, 2 and 3 passes. 2 is the sweet spot; 3 starts to age the face.
+
+![Original, 1, 2 and 3 passes](Docs/images/passes_face.png)
+
+**Stylised characters** get pulled toward photoreal too (strength 0.98, 1 pass):
+
+![Stylised head: Arnold (left) vs DLSS 5 (right)](Docs/images/before_after_face.png)
 
 Runs NVIDIA's **DLSS 5 neural rendering** (NGX feature 18, the "photoreal" pass) on **Arnold renders from Maya**. Output is the **same resolution** as the input; nothing is upscaled.
 
@@ -60,6 +67,7 @@ Maya never loads ReShade. The DLSS work happens in a separate helper process (`r
 
 - **Strength:** 0.25 keeps a stylised character's design and adds realistic skin. 0.98 is a full photoreal re-interpretation.
 - **Passes** (1–3): runs DLSS 5 again on its own output. **2 is the strong setting** on faces (visible pores, stubble, deeper form). 3 overcooks: faces age and drift from the design, and environments soften more.
+- **Exposure** (−2 to +2 stops): brightens or darkens the DLSS 5 output. Extra passes darken faces slightly, and +0.5 to +1 compensates.
 - **Frame ranges** use Arnold's exact motion vectors plus temporal stabilisation, which gives about 30% less "wobble" on faces.
 - **Output:** Auto (single frame → PNG 16-bit, ranges → half-float EXR in the rendering space + 8-bit preview), or EXR / PNG16 / PNG8.
 - **Debug images** (Panel checkbox, off by default): per frame, `compare` (original | DLSS 5), `diff` (where DLSS 5 changed things locally, with the overall colour shift removed) and `inputs` (what DLSS 5 received: colour | depth | motion vectors). They're written to `output/debug`.
