@@ -63,10 +63,11 @@ Maya never loads ReShade. The DLSS work happens in a separate helper process (`r
 | Button | Does |
 |---|---|
 | **Panel** | Strength, Structure, Style, output folder, output format, stabilisation, frame range, EXR sequence |
-| **Render** | The current frame: Arnold → DLSS 5 → Render View. Writes a 16-bit PNG. |
+| **Render** | The current frame: Arnold (its own live progressive render window) → DLSS 5 → Render View. Writes a 16-bit PNG. |
 | **Seq** | Pick any frame of a rendered EXR sequence (with a `Z` AOV) → DLSS 5 on the whole sequence |
 | **Out** | Opens `<project>/images/dlss5` |
 
+- **Live preview:** a single frame (Panel's "Process Current Frame" or the shelf's Render button) shows Arnold's own progressive render window as it renders - buckets filling in live - before DLSS 5 runs and the result replaces it in the Render View. Frame ranges/sequences render silently (no popup per frame).
 - **Strength:** 0.25 keeps a stylised character's design and adds realistic skin. 0.98 is a full photoreal re-interpretation.
 - **Preset:** a starting point for every slider below it - built-in (*Default (safe)*, *Subtle*, *Faces - photoreal*, *Surfaces - crisp*, *Full DLSS 5 look*) or your own, saved with **Save** and removed with **Del**. **Reset** always returns to the safe defaults. All Panel settings are remembered between sessions and shared with the shelf's Render/Seq buttons.
 - **Look amount** (0-1) and **Detail amount** (0-3): our own version of DLSS 5's Tone/Structure pair, not capped by the model. Look 0 keeps Arnold's own lighting, colour and SSS and takes only DLSS 5's fine detail (pores, creases, stubble) - this avoids the "game character / photogrammetry scan" look and replaces the old Full/Detail-only mode switch. Detail above 1 amplifies DLSS 5's own fine detail beyond its Structure cap. **Detail size** 3 px is recommended.

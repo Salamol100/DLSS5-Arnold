@@ -56,12 +56,15 @@ def arnold_shaders():
     return os.path.normpath(os.path.join(arnold_bin(), "..", "shaders"))
 
 
-def _run(args, log, cwd=None):
-    """Run a tool, stream nothing to Maya, honour Cancel. Returns (code, output)."""
+def _run(args, log, cwd=None, show_window=False):
+    """Run a tool, stream nothing to Maya, honour Cancel. Returns (code, output).
+    show_window: let the tool open its own window (kick's live progressive render window,
+    dlss5_host.exe's own window) instead of running hidden."""
     if _state["cancel"]:
         raise Cancelled()
+    hidden = _NO_WINDOW if os.path.basename(args[0]) != "dlss5_host.exe" and not show_window else 0
     p = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         creationflags=_NO_WINDOW if os.path.basename(args[0]) != "dlss5_host.exe" else 0)
+                         creationflags=hidden)
     _state["proc"] = p
     out, _ = p.communicate()
     _state["proc"] = None
@@ -322,13 +325,21 @@ def _patch_ass(ass, exr, display_png=None, view=None):
 # ---------------------------------------------------------------------------------------------
 # worker (any thread)
 
-def _kick(ass, log):
+def _kick(ass, log, live=False):
+    """live: show kick's own progressive render window (buckets filling in as Arnold renders) instead
+    of running hidden. -dw/-dp ("disable window"/"disable progressive") are what silence it normally
+    - dropping them plus adding -nokeypress (so kick doesn't sit waiting for ESC once done) gives a
+    live preview window that closes itself when the frame finishes."""
     kick = os.path.join(arnold_bin(), "kick.exe")
-    args = [kick, "-i", ass, "-dw", "-dp", "-v", "1", "-l", arnold_shaders()]
-    code, text = _run(args, log, cwd=os.path.dirname(ass))
+    if live:
+        args = [kick, "-i", ass, "-nokeypress", "-nocrashpopup", "-v", "1", "-l", arnold_shaders()]
+    else:
+        args = [kick, "-i", ass, "-dw", "-dp", "-v", "1", "-l", arnold_shaders()]
+    code, text = _run(args, log, cwd=os.path.dirname(ass), show_window=live)
     if "no GPU matching requirements" in text or "device selection failed" in text:
         log("  GPU unavailable for Arnold, rendering this frame on CPU")
-        code, text = _run(args + ["-set", "options.render_device", "CPU"], log, cwd=os.path.dirname(ass))
+        code, text = _run(args + ["-set", "options.render_device", "CPU"], log,
+                          cwd=os.path.dirname(ass), show_window=live)
     if code != 0 or "render done" not in text:
         raise RuntimeError("kick failed on " + os.path.basename(ass))
 
@@ -724,7 +735,7 @@ def _write_debug(frame, name, out_dir, work, orig_view, dlss_view, depth_path, m
 def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep_original,
                   log, done, render_scene, use_mv=False, stabilise=0.0, hdr=True, space="ACEScg",
                   aces=True, debug=False, passes=1, exposure=0.0, mode="full", detail_size=3.0,
-                  look=1.0, detail_amount=1.0, dof_aware=True, dof=None):
+                  look=1.0, detail_amount=1.0, dof_aware=True, dof=None, live_preview=False):
     """frames: list of (frame, ass_or_None, exr, display_png_or_None).
     Runs kick (if ass), PFM, host, output. use_mv: pass Arnold's motionvector AOV (as exported by
     export_scene_frames(motion_vectors=True)) to DLSS 5. hdr: run DLSS 5 on a 16-bit float scRGB
@@ -732,7 +743,10 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
     dof_aware: fall back to Arnold's own pixels (feathered) wherever the camera's own depth of field
     puts a pixel out of focus - DLSS 5 posterises smooth defocus blur into flat patches (see
     focus_mask). dof: the camera's depth-of-field parameters from _camera_dof(), or None (no DOF on
-    the camera, or an EXR sequence with no camera info - dof_aware then has nothing to do)."""
+    the camera, or an EXR sequence with no camera info - dof_aware then has nothing to do).
+    live_preview: show kick's own progressive render window while each frame renders (buckets filling
+    in live), instead of rendering hidden. Only meaningful when render_scene is True (kick is doing
+    the rendering) - has no effect on an already-rendered EXR sequence."""
     t0 = time.time()
     try:
         oiio = os.path.join(arnold_bin(), "oiiotool.exe")
@@ -761,7 +775,7 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
             """Render (if ours) + convert one frame; returns its temp-file record."""
             if render_scene:
                 log("Arnold: rendering frame %d (%d/%d)" % (frame, i + 1, len(frames)))
-                _kick(ass, log)
+                _kick(ass, log, live=live_preview)
                 remove(ass)
             log("Preparing frame %d" % frame)
             tag = "f%04d" % frame
@@ -1042,12 +1056,18 @@ def _resolve_fmt(fmt, n_frames):
 def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt="auto",
                          keep_original=True, log=print, done=None, block=False, style=None,
                          motion_vectors=None, stabilise=0.8, hdr=True, debug=False, passes=1, exposure=0.0,
-                         mode="full", detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True):
+                         mode="full", detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True,
+                         live_preview=None):
     """Render frames start..end of the open scene with Arnold, then DLSS 5 them in order.
     motion_vectors: None = automatic (on for ranges, off for a single frame).
     stabilise: 0 = off, else strength of the motion-vector stabilisation of the DLSS edit
     (ranges with motion vectors only).
-    fmt: 'auto' (PNG 16-bit for one frame, EXR for ranges), 'exr', 'png16', 'png8'."""
+    fmt: 'auto' (PNG 16-bit for one frame, EXR for ranges), 'exr', 'png16', 'png8'.
+    live_preview: show Arnold's own progressive render window while it renders. None (default) =
+    automatic: on for a single frame, off for a range (a popping-up window per frame would be more
+    annoying than useful over a sequence)."""
+    if live_preview is None:
+        live_preview = (end == start)
     write_settings(intensity, structure, style)
     fmt = _resolve_fmt(fmt, end - start + 1)
     space, aces = colour_setup()
@@ -1064,7 +1084,8 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
                                done=done or (lambda r, e: None), render_scene=True, use_mv=use_mv,
                                stabilise=stabilise, hdr=hdr, space=space, aces=aces, debug=debug,
                                passes=passes, exposure=exposure, mode=mode, detail_size=detail_size,
-                               look=look, detail_amount=detail_amount, dof_aware=dof_aware, dof=dof), block)
+                               look=look, detail_amount=detail_amount, dof_aware=dof_aware, dof=dof,
+                               live_preview=live_preview), block)
 
 
 def find_sequence(one_file):
@@ -1547,8 +1568,10 @@ def show():
                              "Remembered between sessions and also used by the shelf Render button.")
     cmds.separator(height=6)
     cmds.button(WIN + "_go", label="Process Current Frame", height=32, command=_on_current,
-                annotation="Renders the current frame with Arnold, runs DLSS 5 and shows it in the Render View. "
-                           "A helper window appears for a few seconds - leave it alone.")
+                annotation="Renders the current frame with Arnold, showing its own progressive render "
+                           "window as it renders (buckets filling in live), then runs DLSS 5 and shows "
+                           "the result in the Render View. A helper window then appears for a few "
+                           "seconds - leave it alone.")
     cmds.intFieldGrp(WIN + "_rng", label="Frame range", numberOfFields=2, value1=start, value2=end,
                      columnWidth3=(80, 60, 60),
                      annotation="First and last frame for Process Frame Range.")
