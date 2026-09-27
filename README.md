@@ -1,4 +1,6 @@
-# DLSS 5 Neural Rendering for Arnold (Maya 2024)
+# DLSS5 Arnold!
+
+**DLSS 5 neural rendering for Arnold renders in Maya 2024**
 
 ![Arnold render (left) vs DLSS 5 neural rendering (right)](Docs/images/before_after.png)
 ![Face close-up: Arnold (left) vs DLSS 5 (right)](Docs/images/before_after_face.png)
