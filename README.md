@@ -68,14 +68,22 @@ Maya never loads ReShade. The DLSS work happens in a separate helper process (`r
 | **Out** | Opens `<project>/images/dlss5` |
 
 - **Strength:** 0.25 keeps a stylised character's design and adds realistic skin. 0.98 is a full photoreal re-interpretation.
-- **Mode:** *Full* uses DLSS 5's complete look. *Detail only* keeps Arnold's lighting, colour and SSS and adds only DLSS 5's fine detail (pores, creases, stubble), which avoids the "game character / photogrammetry scan" look. **Detail size** 3 px is recommended.
+- **Preset:** a starting point for every slider below it - built-in (*Default (safe)*, *Subtle*, *Faces - photoreal*, *Surfaces - crisp*, *Full DLSS 5 look*) or your own, saved with **Save** and removed with **Del**. **Reset** always returns to the safe defaults. All Panel settings are remembered between sessions and shared with the shelf's Render/Seq buttons.
+- **Look amount** (0-1) and **Detail amount** (0-3): our own version of DLSS 5's Tone/Structure pair, not capped by the model. Look 0 keeps Arnold's own lighting, colour and SSS and takes only DLSS 5's fine detail (pores, creases, stubble) - this avoids the "game character / photogrammetry scan" look and replaces the old Full/Detail-only mode switch. Detail above 1 amplifies DLSS 5's own fine detail beyond its Structure cap. **Detail size** 3 px is recommended.
+- **Keep out-of-focus areas as Arnold's own render** (on by default): DLSS 5 posterises smooth depth-of-field blur into flat, cel-shaded patches instead of keeping it soft. Using the render camera's own focus distance and aperture (needs **Enable DOF** on that camera) plus the Z-depth pass, this falls back to Arnold's own pixels wherever a pixel is genuinely out of focus, feathered so there's no visible seam. Does nothing if the camera has no depth of field, or on an already-rendered EXR sequence (no live camera to read).
 - **Show result in a viewer window:** opens the result in FCheck when done (sequences play). It stays open and is remembered between sessions.
 - **Passes** (1–3): runs DLSS 5 again on its own output. **2 is the strong setting** on faces (visible pores, stubble, deeper form). 3 overcooks: faces age and drift from the design, and environments soften more.
-- **Exposure** (−2 to +2 stops): brightens or darkens the DLSS 5 output. Extra passes darken faces slightly, and +0.5 to +1 compensates.
+- **Exposure** (−2 to +2 stops): brightens or darkens the DLSS 5 output, applied after the DLSS pass; the saved original Arnold reference PNG is left untouched. Extra passes darken faces slightly, and +0.5 to +1 compensates.
 - **Frame ranges** use Arnold's exact motion vectors plus temporal stabilisation, which gives about 30% less "wobble" on faces.
-- **Output:** Auto (single frame → PNG 16-bit, ranges → half-float EXR in the rendering space + 8-bit preview), or EXR / PNG16 / PNG8.
+- **Output:** Auto (single frame → PNG 16-bit, ranges → half-float EXR in the rendering space + 8-bit preview), or EXR / PNG16 / PNG8. PNGs carry an embedded sRGB profile so they open correctly (not washed out) in colour-managed apps like Photoshop.
 - **Debug images** (Panel checkbox, off by default): per frame, `compare` (original | DLSS 5), `diff` (where DLSS 5 changed things locally, with the overall colour shift removed) and `inputs` (what DLSS 5 received: colour | depth | motion vectors). They're written to `output/debug`.
 - **Disk:** frames are processed in chunks sized to your free space, and temp files are deleted per frame.
+
+**Depth of field, before/after "Keep out-of-focus areas":**
+
+![Blurred tentacle spikes: posterised (left) vs kept soft (right)](Docs/images/dof_fix.png)
+
+*Left: DLSS 5 on its own turns the smooth defocus blur into flat, cel-shaded patches. Right: the same frame with the depth-based focus mask, using the camera's real focus distance/aperture from the Z-depth pass - the out-of-focus tentacles and background coils fall back to Arnold's own pixels, feathered, while the in-focus shell is untouched.*
 
 ## Batch / render farm
 

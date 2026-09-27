@@ -70,7 +70,40 @@ def _run(args, log, cwd=None):
         raise Cancelled()
     if p.returncode != 0:
         log("  {} exited {}:\n{}".format(os.path.basename(args[0]), p.returncode, text[-1500:]))
+    elif "-o" in args and str(args[args.index("-o") + 1]).lower().endswith(".png"):
+        _tag_srgb_png(args[args.index("-o") + 1])
     return p.returncode, text
+
+
+_SRGB_ICC = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "spool", "drivers", "color",
+                         "sRGB Color Space Profile.icm")
+
+
+def _tag_srgb_png(path):
+    """Embed an sRGB ICC profile (plus gAMA/cHRM for simple viewers) in a PNG. oiiotool writes PNGs
+    untagged, and Photoshop then assumes its working space (often Adobe RGB / ProPhoto for 16-bit),
+    which makes the image look washed out or shifted. The pixels are sRGB; this just says so."""
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    try:
+        with open(path, "rb") as f:
+            b = f.read()
+        if b[:8] != b"\x89PNG\r\n\x1a\n" or b[12:16] != b"IHDR" or b"iCCP" in b[:4096] or b"sRGB" in b[33:4096]:
+            return
+        extra = chunk(b"gAMA", struct.pack(">I", 45455)) + chunk(b"cHRM", struct.pack(
+            ">8I", 31270, 32900, 64000, 33000, 30000, 60000, 15000, 6000))
+        if os.path.isfile(_SRGB_ICC):
+            with open(_SRGB_ICC, "rb") as f:
+                extra = chunk(b"iCCP", b"sRGB IEC61966-2.1\x00\x00" + zlib.compress(f.read())) + extra
+        else:
+            extra = chunk(b"sRGB", b"\x00") + extra
+        with open(path, "wb") as f:
+            f.write(b[:33] + extra + b[33:])
+    except (IOError, OSError):
+        pass
 
 
 def exr_channels(exr):
@@ -135,6 +168,29 @@ def _render_camera():
     return cams[0]
 
 
+def _camera_dof(cam):
+    """(focus_distance, aperture_size, focal_length, px_per_cm) for the depth-based focus mask, or
+    None if the camera has no depth of field (mask then leaves DLSS untouched everywhere: nothing to
+    protect). px_per_cm converts the lens' circle-of-confusion (in scene cm) to render pixels, so the
+    mask's falloff is calibrated to an actual blur size on screen rather than an arbitrary scene-unit
+    scale. Read on the main thread only - the render/DLSS pipeline itself runs in a background thread."""
+    try:
+        if not cmds.getAttr(cam + ".aiEnableDOF"):
+            return None
+        focus = cmds.getAttr(cam + ".aiFocusDistance")
+        aperture = cmds.getAttr(cam + ".aiApertureSize")
+        focal_mm = cmds.getAttr(cam + ".focalLength")
+        film_in = cmds.getAttr(cam + ".horizontalFilmAperture")  # inches
+        width_px = cmds.getAttr("defaultResolution.width")
+    except (ValueError, RuntimeError):
+        return None
+    if aperture <= 0 or focus <= 0 or film_in <= 0:
+        return None
+    px_per_cm = width_px / (film_in * 2.54)
+    return dict(focus_distance=focus, aperture_size=aperture, focal_length=focal_mm / 10.0,  # mm -> cm
+               px_per_cm=px_per_cm)
+
+
 def export_scene_frames(work, start, end, motion_vectors=False):
     """Export one .ass per frame with a Z AOV and our own EXR path. Scene settings are restored.
 
@@ -151,6 +207,7 @@ def export_scene_frames(work, start, end, motion_vectors=False):
 
     cam = _render_camera()
     near = cmds.getAttr(cam + ".nearClipPlane")
+    dof = _camera_dof(cam)
     drv = "defaultArnoldDriver"
     opt = "defaultArnoldRenderOptions"
     plugs = [drv + ".aiTranslator", drv + ".mergeAOVs", drv + ".halfPrecision"]
@@ -215,7 +272,7 @@ def export_scene_frames(work, start, end, motion_vectors=False):
         png = os.path.join(work, "display.%04d.png" % frame).replace("\\", "/") if view else None
         _patch_ass(ass, exr, png, view)
         jobs.append((frame, ass, exr, png))
-    return jobs, near
+    return jobs, near, dof
 
 
 def display_transform():
@@ -512,6 +569,65 @@ def detail_only(orig, dlss, sigma=3.0):
     return orig * ratio_d / ratio_o
 
 
+def focus_mask(z, dof):
+    """0..1 mask, one value per pixel: 1 at the camera's focus distance, falling off with the real
+    circle-of-confusion size at each pixel's depth. dof: the dict from _camera_dof (focus_distance,
+    aperture_size, focal_length, all in cm) or None (no depth of field -> mask is all 1: nothing to
+    protect). z: the Z-depth PFM, HxWx1 or HxWx3 (all channels equal), scene units (cm).
+
+    Built from actual depth + lens geometry, not from the image: an earlier version tried to guess
+    "blurred" from local image contrast, but a blurred bright object against a black background (or
+    any strong-but-soft edge) still reads as high local contrast, so it failed on exactly the frames
+    it needed to catch (rig3.ma foreground tentacles measured as "sharp" despite being visibly
+    posterised). Depth doesn't have that failure mode.
+
+    Why any of this: DLSS 5 is trained mostly on sharp in-focus game frames and posterises a smooth
+    defocus gradient into flat, cel-shaded patches instead of reconstructing it. Used in finish() to
+    fall back to Arnold's own pixels wherever this mask is low, feathered so there's no visible seam."""
+    import numpy as np
+    if dof is None:
+        return np.ones_like(z[..., :1] if z.ndim == 3 else z[..., None])
+    zz = z[..., :1] if z.ndim == 3 else z[..., None]
+    s1, a, f = dof["focus_distance"], dof["aperture_size"], dof["focal_length"]
+    zc = np.clip(zz, 1e-4, None)
+    coc_cm = np.abs(a * f * (zc - s1) / np.maximum(zc * (s1 - f), 1e-4))
+    coc_px = coc_cm * dof["px_per_cm"]
+    threshold_px = 1.5  # blur circle radius (px) at which DLSS 5 is treated as starting to posterise
+    return 1.0 / (1.0 + (coc_px / threshold_px) ** 2)
+
+
+def blend_dlss(orig, dlss, look=0.0, detail=1.0, sigma=3.0):
+    """Combine Arnold and DLSS 5 with two independent amounts (our own version of DLSS 5's
+    Tone / Structure pair, not capped by the model):
+
+      look   0..1 : broad lighting/colour. 0 = Arnold's look, 1 = DLSS 5's look (like Tone Intensity)
+      detail 0..3 : DLSS 5's fine detail relative to Arnold's. 1 = as DLSS made it, 2-3 = amplified
+                    beyond the model's Structure cap, 0 = Arnold's own detail only
+
+        low = mix(blur(orig), blur(dlss), look)             r_x = x / blur(x)  (per channel, linear)
+        detail <= 1 : out = low * r_o * (r_d / r_o) ** detail   (Arnold's detail -> DLSS's detail)
+        detail  > 1 : out = low * r_d_luma ** detail             (DLSS's own fine detail amplified)
+
+    Above 1 it amplifies DLSS's detail itself, not its difference from Arnold: on surfaces where DLSS
+    is slightly smoother than Arnold (sand, measured) amplifying the difference would smooth further.
+    Above 1 the amplification factor is computed on luma and applied equally to all channels, not
+    per-channel: per-channel amplification caused red/green/blue fringing at high-contrast silhouette
+    edges (confirmed on rig3.ma, "Surfaces - crisp" preset, detail 1.8) - near an edge one channel's
+    ratio can diverge from the others because each is regularised independently near zero.
+    look=0, detail=1 is exactly detail_only(); look=1, detail=1 reproduces the full DLSS result."""
+    import numpy as np
+    eps = 1e-4
+    bo, bd = _gauss(orig, sigma), _gauss(dlss, sigma)
+    r_o = (np.abs(orig) + eps) / (np.abs(bo) + eps)
+    r_d = (np.abs(dlss) + eps) / (np.abs(bd) + eps)
+    low = bo * (1.0 - look) + bd * look
+    if detail <= 1.0:
+        return low * r_o * np.power(r_d / r_o, detail)
+    luma_d, luma_bd = dlss.mean(axis=2, keepdims=True), bd.mean(axis=2, keepdims=True)
+    r_d_luma = (np.abs(luma_d) + eps) / (np.abs(luma_bd) + eps)
+    return low * np.power(r_d_luma, detail)
+
+
 def _restore_gamut(orig_scrgb, dlss_scrgb):
     """Put back the out-of-Rec.709 part of the input that the DLSS pass dropped.
 
@@ -607,11 +723,16 @@ def _write_debug(frame, name, out_dir, work, orig_view, dlss_view, depth_path, m
 
 def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep_original,
                   log, done, render_scene, use_mv=False, stabilise=0.0, hdr=True, space="ACEScg",
-                  aces=True, debug=False, passes=1, exposure=0.0, mode="full", detail_size=3.0):
+                  aces=True, debug=False, passes=1, exposure=0.0, mode="full", detail_size=3.0,
+                  look=1.0, detail_amount=1.0, dof_aware=True, dof=None):
     """frames: list of (frame, ass_or_None, exr, display_png_or_None).
     Runs kick (if ass), PFM, host, output. use_mv: pass Arnold's motionvector AOV (as exported by
     export_scene_frames(motion_vectors=True)) to DLSS 5. hdr: run DLSS 5 on a 16-bit float scRGB
-    back buffer from the linear EXR (default); False = the older 8-bit display-referred path."""
+    back buffer from the linear EXR (default); False = the older 8-bit display-referred path.
+    dof_aware: fall back to Arnold's own pixels (feathered) wherever the camera's own depth of field
+    puts a pixel out of focus - DLSS 5 posterises smooth defocus blur into flat patches (see
+    focus_mask). dof: the camera's depth-of-field parameters from _camera_dof(), or None (no DOF on
+    the camera, or an EXR sequence with no camera info - dof_aware then has nothing to do)."""
     t0 = time.time()
     try:
         oiio = os.path.join(arnold_bin(), "oiiotool.exe")
@@ -699,8 +820,16 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
             if hdr:
                 orig_in = _read_pfm(j["c"])
                 dl = _restore_gamut(orig_in, dl)
-            if mode == "detail":
-                dl = detail_only(orig_in if hdr else _read_pfm(j["c"]), dl, detail_size)
+            if mode == "detail":            # legacy switch = Look 0
+                look_amt = 0.0
+            else:
+                look_amt = look
+            base = orig_in if hdr else _read_pfm(j["c"])
+            if look_amt < 1.0 or detail_amount != 1.0:
+                dl = blend_dlss(base, dl, look_amt, detail_amount, detail_size)
+            if dof_aware and dof is not None:
+                m = focus_mask(_read_pfm(j["z"]), dof)
+                dl = base * (1.0 - m) + dl * m
             if stab is not None:
                 img = stab.step(orig_in if hdr else _read_pfm(j["c"]), dl,
                                 _read_pfm(j["mv"]) if stab.n else None)
@@ -913,7 +1042,7 @@ def _resolve_fmt(fmt, n_frames):
 def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt="auto",
                          keep_original=True, log=print, done=None, block=False, style=None,
                          motion_vectors=None, stabilise=0.8, hdr=True, debug=False, passes=1, exposure=0.0,
-                         mode="full", detail_size=3.0):
+                         mode="full", detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True):
     """Render frames start..end of the open scene with Arnold, then DLSS 5 them in order.
     motion_vectors: None = automatic (on for ranges, off for a single frame).
     stabilise: 0 = off, else strength of the motion-vector stabilisation of the DLSS edit
@@ -925,13 +1054,17 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
     use_mv = (end > start) if motion_vectors is None else bool(motion_vectors)
     work = _new_work()
     log("Exporting frames %d-%d" % (start, end))
-    frames, near = export_scene_frames(work, start, end, motion_vectors=use_mv)
+    frames, near, dof = export_scene_frames(work, start, end, motion_vectors=use_mv)
+    if dof_aware:
+        log("Depth of field: %s" % ("protecting out-of-focus areas from DLSS 5" if dof is not None
+                                     else "camera has no depth of field - nothing to protect"))
     name = os.path.splitext(os.path.basename(cmds.file(q=True, sn=True) or "untitled"))[0] or "untitled"
     _start(_run_pipeline, dict(frames=frames, out_dir=out_dir, name=name, fmt=fmt, near=near, work=work,
                                allow_flat_depth=False, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=True, use_mv=use_mv,
                                stabilise=stabilise, hdr=hdr, space=space, aces=aces, debug=debug,
-                               passes=passes, exposure=exposure, mode=mode, detail_size=detail_size), block)
+                               passes=passes, exposure=exposure, mode=mode, detail_size=detail_size,
+                               look=look, detail_amount=detail_amount, dof_aware=dof_aware, dof=dof), block)
 
 
 def find_sequence(one_file):
@@ -952,9 +1085,11 @@ def find_sequence(one_file):
 def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, fmt="auto",
                          allow_flat_depth=False, keep_original=True, log=print, done=None, block=False,
                          style=None, hdr=True, debug=False, passes=1, exposure=0.0, mode="full",
-                         detail_size=3.0):
+                         detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True):
     """DLSS 5 an already-rendered EXR sequence: list of (frame, path). The EXRs are assumed to be
-    in the scene's rendering space (ACEScg with Maya's default colour management)."""
+    in the scene's rendering space (ACEScg with Maya's default colour management).
+    dof_aware has no effect here: there's no live camera tied to an already-rendered sequence, so
+    there's nothing safe to read a focus distance from."""
     write_settings(intensity, structure, style)
     fmt = _resolve_fmt(fmt, len(exrs))
     space, aces = colour_setup()
@@ -965,7 +1100,8 @@ def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, 
                                allow_flat_depth=allow_flat_depth, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=False, hdr=hdr,
                                space=space, aces=aces, debug=debug, passes=passes, exposure=exposure,
-                               mode=mode, detail_size=detail_size), block)
+                               mode=mode, detail_size=detail_size, look=look,
+                               detail_amount=detail_amount, dof_aware=dof_aware), block)
 
 
 def cancel():
@@ -997,8 +1133,63 @@ def _ui_log(msg):
 _SHOW_VAR = "dlss5_showResultWindow"  # Maya optionVar: remembered across sessions, used by Panel + shelf
 
 
+def _opt(name, default):
+    """A remembered Panel value (Maya optionVar), shared with the one-click shelf actions."""
+    return cmds.optionVar(q=name) if cmds.optionVar(exists=name) else default
+
+
+# Safe defaults: Arnold look kept, DLSS detail added once. "Reset" always returns here.
+DEFAULTS = dict(intensity=0.98, structure=2.0, style="Default", passes=1, look=0.0,
+                detail_amount=1.0, detail_size=3.0, exposure=0.0, dof_aware=True)
+PRESETS = {
+    "Default (safe)":       {},
+    "Subtle":               dict(detail_amount=0.6),
+    "Faces - photoreal":    dict(passes=2, look=0.5, detail_amount=1.5),
+    "Surfaces - crisp":     dict(detail_amount=1.8, detail_size=1.5),
+    "Full DLSS 5 look":     dict(look=1.0),
+}
+_SETTINGS_VAR, _USER_PRESETS_VAR = "dlss5_settings", "dlss5_userPresets"
+
+
+def _json_var(name, default):
+    import json
+    try:
+        return json.loads(cmds.optionVar(q=name)) if cmds.optionVar(exists=name) else default
+    except ValueError:
+        return default
+
+
+def load_settings():
+    """Panel + shelf settings: defaults overlaid with what was last used (unknown keys dropped)."""
+    s = dict(DEFAULTS)
+    s.update({k: v for k, v in _json_var(_SETTINGS_VAR, {}).items() if k in DEFAULTS})
+    if s["style"] not in STYLES:
+        s["style"] = "Default"
+    return s
+
+
+def save_settings(s):
+    import json
+    cmds.optionVar(stringValue=(_SETTINGS_VAR, json.dumps({k: s[k] for k in DEFAULTS})))
+
+
+def all_presets():
+    p = {k: dict(DEFAULTS, **v) for k, v in PRESETS.items()}
+    p.update({"* " + k: dict(DEFAULTS, **v) for k, v in _json_var(_USER_PRESETS_VAR, {}).items()})
+    return p
+
+
 def _show_result_enabled():
     return bool(cmds.optionVar(q=_SHOW_VAR)) if cmds.optionVar(exists=_SHOW_VAR) else False
+
+
+def _show_in_render_view(path):
+    """Load a finished result into the Render View. PNG results already went through the view transform,
+    so the Render View's own colour management is switched off for them; otherwise ACES is applied a
+    second time and the image looks flat and washed out. Linear EXR results keep it on."""
+    managed = not path.lower().endswith((".png", ".jpg", ".tif"))
+    cmds.renderWindowEditor("renderView", e=True, cmEnabled=managed)
+    cmds.renderWindowEditor("renderView", e=True, loadImage=path)
 
 
 def show_in_viewer(results):
@@ -1027,7 +1218,7 @@ def _ui_done(results, err):
                 cmds.button(WIN + b, e=True, enable=True)
         if results:
             try:
-                cmds.renderWindowEditor("renderView", e=True, loadImage=results[-1])
+                _show_in_render_view(results[-1])
             except RuntimeError:
                 pass
             if _show_result_enabled():
@@ -1037,19 +1228,85 @@ def _ui_done(results, err):
     maya.utils.executeDeferred(upd)
 
 
+# setting -> (panel control, control command)
+_UI_CTRLS = dict(intensity=("_int", "floatSliderGrp"), structure=("_str", "floatSliderGrp"),
+                 style=("_sty", "optionMenuGrp"), passes=("_pas", "intSliderGrp"),
+                 exposure=("_exp", "floatSliderGrp"), look=("_look", "floatSliderGrp"),
+                 detail_amount=("_damt", "floatSliderGrp"), detail_size=("_dsz", "floatSliderGrp"),
+                 dof_aware=("_dof", "checkBox"))
+
+
+def _ui_settings():
+    return {k: getattr(cmds, fn)(WIN + c, q=True, value=True) for k, (c, fn) in _UI_CTRLS.items()}
+
+
+def _ui_set(s):
+    for k, (c, fn) in _UI_CTRLS.items():
+        getattr(cmds, fn)(WIN + c, e=True, value=s[k])
+    save_settings(s)
+
+
+def _ui_changed(*_):
+    save_settings(_ui_settings())
+
+
+def _ui_preset(name):
+    p = all_presets().get(name)
+    if p:
+        _ui_set(p)
+
+
+def _ui_reset(*_):
+    _ui_set(dict(DEFAULTS))
+    cmds.optionMenuGrp(WIN + "_pre", e=True, value="Default (safe)")
+
+
+def _ui_fill_presets(select=None):
+    menu = WIN + "_pre"
+    for item in cmds.optionMenuGrp(menu, q=True, itemListLong=True) or []:
+        cmds.deleteUI(item)
+    cmds.setParent(menu + "|OptionMenu", menu=True)
+    for name in all_presets():
+        cmds.menuItem(label=name)
+    if select:
+        cmds.optionMenuGrp(menu, e=True, value=select)
+
+
+def _ui_save_preset(*_):
+    import json
+    if cmds.promptDialog(title="Save DLSS 5 preset", message="Preset name:", button=["Save", "Cancel"],
+                         defaultButton="Save", cancelButton="Cancel") != "Save":
+        return
+    name = cmds.promptDialog(q=True, text=True).strip()
+    if not name:
+        return
+    user = _json_var(_USER_PRESETS_VAR, {})
+    user[name] = _ui_settings()
+    cmds.optionVar(stringValue=(_USER_PRESETS_VAR, json.dumps(user)))
+    _ui_fill_presets("* " + name)
+
+
+def _ui_delete_preset(*_):
+    import json
+    name = cmds.optionMenuGrp(WIN + "_pre", q=True, value=True)
+    if not name.startswith("* "):
+        cmds.warning("DLSS 5: built-in presets can't be deleted (only your own, marked *)")
+        return
+    user = _json_var(_USER_PRESETS_VAR, {})
+    user.pop(name[2:], None)
+    cmds.optionVar(stringValue=(_USER_PRESETS_VAR, json.dumps(user)))
+    _ui_fill_presets()
+
+
 def _ui_vals():
+    s = _ui_settings()
+    save_settings(s)
     return dict(
-        intensity=cmds.floatSliderGrp(WIN + "_int", q=True, value=True),
-        structure=cmds.floatSliderGrp(WIN + "_str", q=True, value=True),
-        style=cmds.optionMenuGrp(WIN + "_sty", q=True, value=True),
+        s,
         out_dir=cmds.textFieldButtonGrp(WIN + "_out", q=True, text=True),
         fmt=_UI_FORMATS[cmds.optionMenuGrp(WIN + "_fmt", q=True, value=True)],
         keep_original=cmds.checkBox(WIN + "_orig", q=True, value=True),
         debug=cmds.checkBox(WIN + "_dbg", q=True, value=True),
-        passes=cmds.intSliderGrp(WIN + "_pas", q=True, value=True),
-        exposure=cmds.floatSliderGrp(WIN + "_exp", q=True, value=True),
-        mode="detail" if cmds.optionMenuGrp(WIN + "_mode", q=True, value=True).startswith("Detail") else "full",
-        detail_size=cmds.floatSliderGrp(WIN + "_dsz", q=True, value=True),
     )
 
 
@@ -1127,7 +1384,7 @@ def _shelf_done(results, err):
     def upd():
         if results:
             try:
-                cmds.renderWindowEditor("renderView", e=True, loadImage=results[-1])
+                _show_in_render_view(results[-1])
             except RuntimeError:
                 pass
             if _show_result_enabled():
@@ -1139,11 +1396,10 @@ def _shelf_done(results, err):
 
 def quick_frame():
     """Shelf 'Render': current frame -> Arnold -> DLSS 5 -> Render View."""
-    intensity, structure = read_settings()
     f = int(cmds.currentTime(q=True))
     try:
-        process_scene_frames(f, f, default_out_dir(), intensity=intensity, structure=structure,
-                             log=_shelf_log, done=_shelf_done)
+        process_scene_frames(f, f, default_out_dir(), mode="full", log=_shelf_log, done=_shelf_done,
+                             **load_settings())
     except Exception as e:
         _state["busy"] = False
         cmds.warning("DLSS 5: %s" % e)
@@ -1167,11 +1423,10 @@ def quick_sequence():
         near = cmds.getAttr(_render_camera() + ".nearClipPlane")
     except Exception:
         near = 0.1
-    intensity, structure = read_settings()
     _shelf_log("sequence of %d frame(s) %d-%d" % (len(seq), seq[0][0], seq[-1][0]))
     try:
-        process_exr_sequence(seq, default_out_dir(), near=near, intensity=intensity, structure=structure,
-                             allow_flat_depth=not has_z, log=_shelf_log, done=_shelf_done)
+        process_exr_sequence(seq, default_out_dir(), near=near, allow_flat_depth=not has_z, mode="full",
+                             log=_shelf_log, done=_shelf_done, **load_settings())
     except Exception as e:
         _state["busy"] = False
         cmds.warning("DLSS 5: %s" % e)
@@ -1198,7 +1453,7 @@ def _browse(*_):
 def show():
     if cmds.window(WIN, exists=True):
         cmds.deleteUI(WIN)
-    intensity, structure = read_settings()
+    s = load_settings()
     ws = cmds.workspace(q=True, rootDirectory=True)
     out = os.path.join(ws, "images", "dlss5").replace("\\", "/")
     try:
@@ -1212,38 +1467,52 @@ def show():
     cmds.columnLayout(adjustableColumn=True, rowSpacing=6, columnAttach=("both", 8))
     cmds.text(label="Arnold render -> DLSS 5 neural rendering, same resolution (no upscaling)",
               align="left", font="smallObliqueLabelFont")
+    cmds.rowLayout(numberOfColumns=4, adjustableColumn=1, columnAttach4=("both", "both", "both", "both"))
+    cmds.optionMenuGrp(WIN + "_pre", label="Preset", columnWidth2=(80, 170), changeCommand=_ui_preset,
+                       annotation="Pick a starting point; every slider below is set from it. Your own presets "
+                                  "are marked *. Panel settings are remembered and used by the shelf buttons too.")
+    cmds.button(label="Reset", width=50, command=_ui_reset,
+                annotation="Put every setting back to the safe defaults (Arnold look kept, DLSS detail x1).")
+    cmds.button(label="Save", width=45, command=_ui_save_preset,
+                annotation="Save the current settings as your own preset.")
+    cmds.button(label="Del", width=35, command=_ui_delete_preset, annotation="Delete the selected * preset.")
+    cmds.setParent("..")
     cmds.floatSliderGrp(WIN + "_int", label="Strength", field=True, minValue=0.0, maxValue=1.0,
-                        value=intensity, precision=2, columnWidth3=(80, 50, 280),
+                        value=s["intensity"], precision=2, columnWidth3=(80, 50, 280),
                         annotation="How much of the DLSS 5 result is used (RenoDX NR Intensity). "
                                    "0.25 = subtle, keeps a stylised design; 0.98 = full photoreal. "
                                    "Values above 1 have no extra effect (the model caps at 1).")
     cmds.floatSliderGrp(WIN + "_str", label="Structure", field=True, minValue=0.0, maxValue=2.0,
-                        value=structure, precision=2, columnWidth3=(80, 50, 280),
+                        value=s["structure"], precision=2, columnWidth3=(80, 50, 280),
                         annotation="Fine-detail strength of the neural pass (RenoDX Structure Intensity): contact "
                                    "shadows, micro detail, SSS. 2 = maximum; higher values are ignored.")
-    cmds.intSliderGrp(WIN + "_pas", label="Passes", field=True, minValue=1, maxValue=3, value=1,
+    cmds.intSliderGrp(WIN + "_pas", label="Passes", field=True, minValue=1, maxValue=3, value=s["passes"],
                       columnWidth3=(80, 50, 280),
                       annotation="Run DLSS 5 again on its own output. 1 = normal, 2 = strong photoreal (sweet spot "
                                  "on faces), 3 = overcooked: faces age and drift, environments soften more")
-    cmds.optionMenuGrp(WIN + "_mode", label="Mode", columnWidth2=(80, 300),
-                       annotation="Full: DLSS 5's complete look. Detail only: keep Arnold's lighting/colour/SSS "
-                                  "and add only DLSS 5's fine skin/surface detail (avoids the 'game scan' look)")
-    cmds.menuItem(label="Full (DLSS 5 look)")
-    cmds.menuItem(label="Detail only (keep Arnold look)")
-    cmds.floatSliderGrp(WIN + "_dsz", label="Detail size", field=True, minValue=1.0, maxValue=8.0, value=3.0,
+    cmds.floatSliderGrp(WIN + "_look", label="Look amount", field=True, minValue=0.0, maxValue=1.0,
+                        value=s["look"], precision=2, columnWidth3=(80, 50, 280),
+                        annotation="How much of DLSS 5's broad lighting and colour to use. 0 = keep your Arnold look "
+                                   "(only DLSS detail is added - avoids the 'game scan' look), 1 = full DLSS 5 look. "
+                                   "Like DLSS 5's own Tone control.")
+    cmds.floatSliderGrp(WIN + "_damt", label="Detail amount", field=True, minValue=0.0, maxValue=3.0,
+                        value=s["detail_amount"], precision=2, columnWidth3=(80, 50, 280),
+                        annotation="How strongly DLSS 5's fine detail (pores, grain, creases) is applied. 1 = as DLSS "
+                                   "made it, 2-3 = amplified beyond the model's own Structure limit, 0 = none.")
+    cmds.floatSliderGrp(WIN + "_dsz", label="Detail size", field=True, minValue=1.0, maxValue=8.0, value=s["detail_size"],
                         precision=1, columnWidth3=(80, 50, 280),
                         annotation="Detail only: how coarse the taken DLSS detail is, in pixels. 1.5 = pores only, "
                                    "3 = pores + small creases (recommended), 6+ = includes more of DLSS's shading")
-    cmds.floatSliderGrp(WIN + "_exp", label="Exposure", field=True, minValue=-2.0, maxValue=2.0, value=0.0,
+    cmds.floatSliderGrp(WIN + "_exp", label="Exposure", field=True, minValue=-2.0, maxValue=2.0, value=s["exposure"],
                         precision=2, columnWidth3=(80, 50, 280),
                         annotation="Stops applied to the DLSS 5 output (EXR and PNG), after the DLSS pass. "
                                    "The saved original is not changed.")
     cmds.optionMenuGrp(WIN + "_sty", label="Style", columnWidth2=(80, 120),
                        annotation="DLSS 5 grading style (RenoDX NR Style). Default = the game setting, best detail. "
                                   "Natural = flatter and softer. Cinematic = deeper shadows, softens more.")
-    for s in STYLES:
-        cmds.menuItem(label=s)
-    cmds.optionMenuGrp(WIN + "_sty", e=True, value=read_style())
+    for st in STYLES:
+        cmds.menuItem(label=st)
+    cmds.optionMenuGrp(WIN + "_sty", e=True, value=s["style"])
     cmds.textFieldButtonGrp(WIN + "_out", label="Folder", text=out, buttonLabel="...",
                             buttonCommand=_browse, columnWidth3=(80, 300, 40),
                             annotation="Where results are saved. Default: <project>/images/dlss5. "
@@ -1260,6 +1529,17 @@ def show():
     cmds.checkBox(WIN + "_dbg", label="Save debug images (compare, change map, DLSS inputs) in output/debug", value=False,
                   annotation="Per frame: compare = original | DLSS 5; diff = where DLSS 5 changed things locally "
                              "(heat map); inputs = what DLSS 5 received (colour | depth | motion vectors).")
+    cmds.checkBox(WIN + "_dof", label="Keep out-of-focus areas as Arnold's own render (recommended)",
+                  value=s["dof_aware"],
+                  annotation="DLSS 5 posterises smooth depth-of-field blur into flat, cel-shaded patches "
+                             "instead of keeping it soft. Using the camera's own focus distance and "
+                             "aperture (needs Enable DOF on the render camera), this falls back to "
+                             "Arnold's own pixels wherever a pixel is out of focus, feathered so there's "
+                             "no visible seam. Does nothing if the camera has no depth of field. Turn "
+                             "off only to compare against raw DLSS 5.")
+    _ui_fill_presets()
+    for c, fn in _UI_CTRLS.values():
+        getattr(cmds, fn)(WIN + c, e=True, changeCommand=_ui_changed)
     cmds.checkBox(WIN + "_show", label="Show result in a viewer window when done (stays open; also for the shelf)",
                   value=_show_result_enabled(),
                   changeCommand=lambda v: cmds.optionVar(intValue=(_SHOW_VAR, int(bool(v)))),
