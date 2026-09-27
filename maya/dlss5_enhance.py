@@ -733,6 +733,23 @@ def _restore_gamut(orig_scrgb, dlss_scrgb):
     return dlss_scrgb + (neg_in - neg_out) * (neg_out > neg_in)
 
 
+def _write_sidecar(shown, frame, **settings):
+    """Write the Panel/preset settings that produced 'shown' to a small JSON file next to it, so an
+    old render is self-documenting instead of relying on memory or the log. Best-effort: a failure
+    here (e.g. a read-only output folder) never breaks the render itself."""
+    import json
+    try:
+        path = os.path.splitext(shown)[0] + ".json"
+        settings["frame"] = frame
+        settings["intensity"], settings["structure"] = read_settings()
+        settings["style"] = read_style()
+        settings["written"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "w") as f:
+            json.dump(settings, f, indent=2, sort_keys=True)
+    except (IOError, OSError):
+        pass
+
+
 def _write_outputs(img_scrgb, frame, name, out_dir, work, fmt, space, aces, log, exposure=0.0):
     """scRGB result -> requested format (+ 8-bit preview for EXR). Returns the path to show.
     exposure: stops applied to the output (scene-linear, before the view), not to the DLSS input."""
@@ -959,6 +976,9 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
                 else:
                     ov, dv = _read_pfm(j["c"]), img
                 _write_debug(frame, name, out_dir, work, ov, dv, j["z"], j["mv"], log)
+            _write_sidecar(shown, frame, passes=passes, exposure=exposure, mode=mode,
+                          detail_size=detail_size, look=look, detail_amount=detail_amount,
+                          dof_aware=dof_aware, hdr=hdr, aces_compress=aces_compress)
             remove(j["c"], j.get("c_lin"), j["z"], j["mv"], j["out"], tmp)
             return shown
 

@@ -84,6 +84,7 @@ Maya never loads ReShade. The DLSS work happens in a separate helper process (`r
 - **Frame ranges** use Arnold's exact motion vectors plus temporal stabilisation, which gives about 30% less "wobble" on faces.
 - **Output:** Auto (single frame → PNG 16-bit, ranges → half-float EXR in the rendering space + 8-bit preview), or EXR / PNG16 / PNG8. PNGs carry an embedded sRGB profile so they open correctly (not washed out) in colour-managed apps like Photoshop.
 - **Debug images** (Panel checkbox, off by default): per frame, `compare` (original | DLSS 5), `diff` (where DLSS 5 changed things locally, with the overall colour shift removed) and `inputs` (what DLSS 5 received: colour | depth | motion vectors). They're written to `output/debug`.
+- **Settings sidecar:** every DLSS 5 result is saved with a small `.json` file next to it (same name, e.g. `shot_dlss5.0045.json`) recording every setting that produced it - Strength, Structure, Style, Passes, Look/Detail amount, Exposure, Linear HDR input, Compress before DLSS, DOF-aware - so an old render is self-documenting instead of relying on memory or the log.
 - **Disk:** frames are processed in chunks sized to your free space, and temp files are deleted per frame.
 
 **Depth of field, before/after "Keep out-of-focus areas":**
