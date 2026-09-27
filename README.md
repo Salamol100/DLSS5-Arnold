@@ -35,7 +35,7 @@ Maya never loads ReShade. The DLSS work happens in a separate helper process (`r
 ## Setup
 
 1. **Build the helper.** Run `host\build.bat`, which writes `runtime\dlss5_host.exe`. See [Docs/BUILD.md](Docs/BUILD.md).
-2. **Copy your own DLSS 5 runtime into `runtime\`.** These files are *not* included (proprietary or third-party):
+2. **Copy your own DLSS 5 runtime into `runtime\`.** These files are *not* included (proprietary or third-party). To get them, **download a DLSS 5 wrapper**: the DLSS5-Feeder + RenoDX DLSS5 setup people use to run DLSS 5 in games. Copy these files from it:
 
    | File | From |
    |---|---|
