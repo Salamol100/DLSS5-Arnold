@@ -15,6 +15,8 @@
 ![Stylised head: Arnold (left) vs DLSS 5 (right)](Docs/images/before_after_face.png)
 
 Runs NVIDIA's **DLSS 5 neural rendering** (NGX feature 18, the "photoreal" pass) on **Arnold renders from Maya**. Output is the **same resolution** as the input; nothing is upscaled.
+As far as we know, this is the **first DLSS 5 tool for Maya/Arnold**, and the first to feed the model the renderer's **real depth and exact motion vectors** in **16-bit linear (ACES)**. Other DLSS 5 image/video tools work from flat images; see *Related projects*.
+
 
 - **What it's good at:** photoreal re-rendering of **characters and faces**. Skin, eyes and lips get the same transformation you see in games that use DLSS 5.
 - **What it's not:** a general detail enhancer. On environments and props it applies a mild relight and softens the image slightly. See [Docs/TEST_RESULTS.md](Docs/TEST_RESULTS.md) for the measurements.
@@ -66,6 +68,8 @@ Maya never loads ReShade. The DLSS work happens in a separate helper process (`r
 | **Out** | Opens `<project>/images/dlss5` |
 
 - **Strength:** 0.25 keeps a stylised character's design and adds realistic skin. 0.98 is a full photoreal re-interpretation.
+- **Mode:** *Full* uses DLSS 5's complete look. *Detail only* keeps Arnold's lighting, colour and SSS and adds only DLSS 5's fine detail (pores, creases, stubble), which avoids the "game character / photogrammetry scan" look. **Detail size** 3 px is recommended.
+- **Show result in a viewer window:** opens the result in FCheck when done (sequences play). It stays open and is remembered between sessions.
 - **Passes** (1–3): runs DLSS 5 again on its own output. **2 is the strong setting** on faces (visible pores, stubble, deeper form). 3 overcooks: faces age and drift from the design, and environments soften more.
 - **Exposure** (−2 to +2 stops): brightens or darkens the DLSS 5 output. Extra passes darken faces slightly, and +0.5 to +1 compensates.
 - **Frame ranges** use Arnold's exact motion vectors plus temporal stabilisation, which gives about 30% less "wobble" on faces.
@@ -84,6 +88,18 @@ The helper must open a window on the GPU. It works from `mayapy` or from a Deadl
 - [Docs/INPUT_REQUIREMENTS.md](Docs/INPUT_REQUIREMENTS.md): colour, depth and motion-vector contract
 - [Docs/BUILD.md](Docs/BUILD.md): building the helper
 - [Docs/TEST_RESULTS.md](Docs/TEST_RESULTS.md): all measurements
+
+## Related projects
+
+Other tools that run DLSS 5 neural rendering outside games (image/video, from flat frames):
+- [Merserk/dlss5-visual-enhancer](https://github.com/Merserk/dlss5-visual-enhancer): images and video app
+- [Blueforcer/ComfyUI-DLSS5-Enhancer](https://github.com/Blueforcer/ComfyUI-DLSS5-Enhancer): ComfyUI nodes
+- [RH-RunningHub/ComfyUI-RH-DLSS5](https://github.com/RH-RunningHub/ComfyUI-RH-DLSS5): ComfyUI nodes
+- [NIGos/dlss5-bridge](https://github.com/NIGos/dlss5-bridge), [faisalkindi/DLSS5oneclick](https://github.com/faisalkindi/DLSS5oneclick): game setups
+
+What this project adds: it sits inside the Maya/Arnold render, and it uses real render depth and exact Arnold
+motion vectors instead of estimated optical flow. It works in 16-bit linear with ACES (keeping out-of-gamut colour),
+with stabilisation along the true motion, Detail-only mode, and measured results on CG content (Docs/TEST_RESULTS.md).
 
 ## Author
 

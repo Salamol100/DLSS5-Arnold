@@ -82,7 +82,9 @@ def exr_channels(exr):
 # ---------------------------------------------------------------------------------------------
 # settings (existing RenoDX keys in the project-local ReShade.ini only)
 
-STYLES = ["Natural", "Cinematic"]  # RenoDX "NR Style" -> NGX DLSSNR.Style (index = NRStyle)
+# RenoDX "NR Style" -> NGX DLSSNR.Style (index = NRStyle); order confirmed from RenoDX's own panel,
+# which shows "Default" for NRStyle=0 (the value the game profile uses).
+STYLES = ["Default", "Natural", "Cinematic"]
 
 
 def write_settings(intensity, structure, style=None):
@@ -120,7 +122,7 @@ def read_style():
                     return STYLES[int(line.split("=", 1)[1])]
     except (IOError, ValueError, IndexError):
         pass
-    return "Cinematic"
+    return "Default"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -473,6 +475,43 @@ def _hdr_input(exr, work, tag, space, log):
     return out
 
 
+def _box_blur(img, r):
+    """Box blur of radius r (integer) on an HxWxC array, edge-clamped, via cumulative sums."""
+    import numpy as np
+    if r < 1:
+        return img
+    k = 2 * r + 1
+    p = np.pad(img, ((r, r), (r, r), (0, 0)), mode="edge")
+    c = np.cumsum(np.cumsum(p, axis=0), axis=1)
+    c = np.pad(c, ((1, 0), (1, 0), (0, 0)))
+    return (c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]) / (k * k)
+
+
+def _gauss(img, sigma):
+    """Gaussian approximation: three box blurs (sigma^2 = 3 * (w^2 - 1) / 12 per pass)."""
+    import math
+    w = math.sqrt(4.0 * sigma * sigma + 1.0)
+    r = max(1, int(round((w - 1) / 2)))
+    for _ in range(3):
+        img = _box_blur(img, r)
+    return img
+
+
+def detail_only(orig, dlss, sigma=3.0):
+    """'Detail only' mode: keep Arnold's broad look (lighting, colour, SSS) and take only DLSS 5's
+    fine detail - pores, creases, stubble - avoiding the 'game character / photogrammetry' regrade.
+
+        out = orig * (dlss / blur(dlss)) / (orig / blur(orig))     per channel, scene-linear
+
+    Measured on a face (tools/test_detail_only.py, split sigma 3 px): colour/lighting change vs
+    Arnold 0.003 (full DLSS: 0.024) with more fine detail than full DLSS (0.0228 vs 0.0212)."""
+    import numpy as np
+    eps = 1e-4
+    ratio_d = (np.abs(dlss) + eps) / (np.abs(_gauss(dlss, sigma)) + eps)
+    ratio_o = (np.abs(orig) + eps) / (np.abs(_gauss(orig, sigma)) + eps)
+    return orig * ratio_d / ratio_o
+
+
 def _restore_gamut(orig_scrgb, dlss_scrgb):
     """Put back the out-of-Rec.709 part of the input that the DLSS pass dropped.
 
@@ -568,7 +607,7 @@ def _write_debug(frame, name, out_dir, work, orig_view, dlss_view, depth_path, m
 
 def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep_original,
                   log, done, render_scene, use_mv=False, stabilise=0.0, hdr=True, space="ACEScg",
-                  aces=True, debug=False, passes=1, exposure=0.0):
+                  aces=True, debug=False, passes=1, exposure=0.0, mode="full", detail_size=3.0):
     """frames: list of (frame, ass_or_None, exr, display_png_or_None).
     Runs kick (if ass), PFM, host, output. use_mv: pass Arnold's motionvector AOV (as exported by
     export_scene_frames(motion_vectors=True)) to DLSS 5. hdr: run DLSS 5 on a 16-bit float scRGB
@@ -660,6 +699,8 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
             if hdr:
                 orig_in = _read_pfm(j["c"])
                 dl = _restore_gamut(orig_in, dl)
+            if mode == "detail":
+                dl = detail_only(orig_in if hdr else _read_pfm(j["c"]), dl, detail_size)
             if stab is not None:
                 img = stab.step(orig_in if hdr else _read_pfm(j["c"]), dl,
                                 _read_pfm(j["mv"]) if stab.n else None)
@@ -871,7 +912,8 @@ def _resolve_fmt(fmt, n_frames):
 
 def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt="auto",
                          keep_original=True, log=print, done=None, block=False, style=None,
-                         motion_vectors=None, stabilise=0.8, hdr=True, debug=False, passes=1, exposure=0.0):
+                         motion_vectors=None, stabilise=0.8, hdr=True, debug=False, passes=1, exposure=0.0,
+                         mode="full", detail_size=3.0):
     """Render frames start..end of the open scene with Arnold, then DLSS 5 them in order.
     motion_vectors: None = automatic (on for ranges, off for a single frame).
     stabilise: 0 = off, else strength of the motion-vector stabilisation of the DLSS edit
@@ -889,7 +931,7 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
                                allow_flat_depth=False, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=True, use_mv=use_mv,
                                stabilise=stabilise, hdr=hdr, space=space, aces=aces, debug=debug,
-                               passes=passes, exposure=exposure), block)
+                               passes=passes, exposure=exposure, mode=mode, detail_size=detail_size), block)
 
 
 def find_sequence(one_file):
@@ -909,7 +951,8 @@ def find_sequence(one_file):
 
 def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, fmt="auto",
                          allow_flat_depth=False, keep_original=True, log=print, done=None, block=False,
-                         style=None, hdr=True, debug=False, passes=1, exposure=0.0):
+                         style=None, hdr=True, debug=False, passes=1, exposure=0.0, mode="full",
+                         detail_size=3.0):
     """DLSS 5 an already-rendered EXR sequence: list of (frame, path). The EXRs are assumed to be
     in the scene's rendering space (ACEScg with Maya's default colour management)."""
     write_settings(intensity, structure, style)
@@ -921,7 +964,8 @@ def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, 
     _start(_run_pipeline, dict(frames=frames, out_dir=out_dir, name=name, fmt=fmt, near=near, work=work,
                                allow_flat_depth=allow_flat_depth, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=False, hdr=hdr,
-                               space=space, aces=aces, debug=debug, passes=passes, exposure=exposure), block)
+                               space=space, aces=aces, debug=debug, passes=passes, exposure=exposure,
+                               mode=mode, detail_size=detail_size), block)
 
 
 def cancel():
@@ -950,6 +994,32 @@ def _ui_log(msg):
     maya.utils.executeDeferred(upd)
 
 
+_SHOW_VAR = "dlss5_showResultWindow"  # Maya optionVar: remembered across sessions, used by Panel + shelf
+
+
+def _show_result_enabled():
+    return bool(cmds.optionVar(q=_SHOW_VAR)) if cmds.optionVar(exists=_SHOW_VAR) else False
+
+
+def show_in_viewer(results):
+    """Open the result in FCheck (Maya's image viewer). It stays open until closed and runs as a
+    separate process. A sequence opens as an animation (frames numbered name.####.ext)."""
+    if not results:
+        return
+    fcheck = os.path.join(os.environ.get("MAYA_LOCATION", r"C:\Program Files\Autodesk\Maya2024"), "bin", "fcheck.exe")
+    first = results[0]
+    args = [fcheck, first]
+    if len(results) > 1:
+        m = re.match(r"^(.*\.)(-?\d+)(\.\w+)$", first)
+        nums = [int(re.match(r"^.*\.(-?\d+)\.\w+$", r).group(1)) for r in results]
+        if m:
+            args = [fcheck, "-n", str(min(nums)), str(max(nums)), "1", m.group(1) + "#" + m.group(3)]
+    try:
+        subprocess.Popen(args, creationflags=0x00000008)  # DETACHED_PROCESS: independent of Maya
+    except OSError as e:
+        print("[DLSS5] could not open FCheck: %s" % e)
+
+
 def _ui_done(results, err):
     def upd():
         if cmds.control(WIN + "_go", exists=True):
@@ -960,6 +1030,8 @@ def _ui_done(results, err):
                 cmds.renderWindowEditor("renderView", e=True, loadImage=results[-1])
             except RuntimeError:
                 pass
+            if _show_result_enabled():
+                show_in_viewer(results)
         if err and err != "cancelled":
             cmds.confirmDialog(title="DLSS 5", message=err, button=["OK"])
     maya.utils.executeDeferred(upd)
@@ -976,6 +1048,8 @@ def _ui_vals():
         debug=cmds.checkBox(WIN + "_dbg", q=True, value=True),
         passes=cmds.intSliderGrp(WIN + "_pas", q=True, value=True),
         exposure=cmds.floatSliderGrp(WIN + "_exp", q=True, value=True),
+        mode="detail" if cmds.optionMenuGrp(WIN + "_mode", q=True, value=True).startswith("Detail") else "full",
+        detail_size=cmds.floatSliderGrp(WIN + "_dsz", q=True, value=True),
     )
 
 
@@ -1056,6 +1130,8 @@ def _shelf_done(results, err):
                 cmds.renderWindowEditor("renderView", e=True, loadImage=results[-1])
             except RuntimeError:
                 pass
+            if _show_result_enabled():
+                show_in_viewer(results)
         if err and err != "cancelled":
             cmds.confirmDialog(title="DLSS 5", message=err, button=["OK"])
     maya.utils.executeDeferred(upd)
@@ -1137,40 +1213,82 @@ def show():
     cmds.text(label="Arnold render -> DLSS 5 neural rendering, same resolution (no upscaling)",
               align="left", font="smallObliqueLabelFont")
     cmds.floatSliderGrp(WIN + "_int", label="Strength", field=True, minValue=0.0, maxValue=1.0,
-                        value=intensity, precision=2, columnWidth3=(80, 50, 280))
+                        value=intensity, precision=2, columnWidth3=(80, 50, 280),
+                        annotation="How much of the DLSS 5 result is used (RenoDX NR Intensity). "
+                                   "0.25 = subtle, keeps a stylised design; 0.98 = full photoreal. "
+                                   "Values above 1 have no extra effect (the model caps at 1).")
     cmds.floatSliderGrp(WIN + "_str", label="Structure", field=True, minValue=0.0, maxValue=2.0,
-                        value=structure, precision=2, columnWidth3=(80, 50, 280))
+                        value=structure, precision=2, columnWidth3=(80, 50, 280),
+                        annotation="Fine-detail strength of the neural pass (RenoDX Structure Intensity): contact "
+                                   "shadows, micro detail, SSS. 2 = maximum; higher values are ignored.")
     cmds.intSliderGrp(WIN + "_pas", label="Passes", field=True, minValue=1, maxValue=3, value=1,
                       columnWidth3=(80, 50, 280),
                       annotation="Run DLSS 5 again on its own output. 1 = normal, 2 = strong photoreal (sweet spot "
                                  "on faces), 3 = overcooked: faces age and drift, environments soften more")
+    cmds.optionMenuGrp(WIN + "_mode", label="Mode", columnWidth2=(80, 300),
+                       annotation="Full: DLSS 5's complete look. Detail only: keep Arnold's lighting/colour/SSS "
+                                  "and add only DLSS 5's fine skin/surface detail (avoids the 'game scan' look)")
+    cmds.menuItem(label="Full (DLSS 5 look)")
+    cmds.menuItem(label="Detail only (keep Arnold look)")
+    cmds.floatSliderGrp(WIN + "_dsz", label="Detail size", field=True, minValue=1.0, maxValue=8.0, value=3.0,
+                        precision=1, columnWidth3=(80, 50, 280),
+                        annotation="Detail only: how coarse the taken DLSS detail is, in pixels. 1.5 = pores only, "
+                                   "3 = pores + small creases (recommended), 6+ = includes more of DLSS's shading")
     cmds.floatSliderGrp(WIN + "_exp", label="Exposure", field=True, minValue=-2.0, maxValue=2.0, value=0.0,
                         precision=2, columnWidth3=(80, 50, 280),
                         annotation="Stops applied to the DLSS 5 output (EXR and PNG), after the DLSS pass. "
                                    "The saved original is not changed.")
-    cmds.optionMenuGrp(WIN + "_sty", label="Style", columnWidth2=(80, 100))
+    cmds.optionMenuGrp(WIN + "_sty", label="Style", columnWidth2=(80, 120),
+                       annotation="DLSS 5 grading style (RenoDX NR Style). Default = the game setting, best detail. "
+                                  "Natural = flatter and softer. Cinematic = deeper shadows, softens more.")
     for s in STYLES:
         cmds.menuItem(label=s)
     cmds.optionMenuGrp(WIN + "_sty", e=True, value=read_style())
-    cmds.textFieldButtonGrp(WIN + "_out", label="Output", text=out, buttonLabel="...",
-                            buttonCommand=_browse, columnWidth3=(80, 300, 40))
-    cmds.optionMenuGrp(WIN + "_fmt", label="Output", columnWidth2=(80, 260))
+    cmds.textFieldButtonGrp(WIN + "_out", label="Folder", text=out, buttonLabel="...",
+                            buttonCommand=_browse, columnWidth3=(80, 300, 40),
+                            annotation="Where results are saved. Default: <project>/images/dlss5. "
+                                       "Rendering the same frame again overwrites its files.")
+    cmds.optionMenuGrp(WIN + "_fmt", label="Format", columnWidth2=(80, 260),
+                       annotation="Auto = PNG 16-bit for one frame, EXR for ranges. EXR = half float in the "
+                                  "rendering space (ACEScg), for compositing, plus an 8-bit preview. "
+                                  "PNG 16/8 = finished image through your ACES view.")
     for f in _UI_FORMATS:
         cmds.menuItem(label=f)
-    cmds.checkBox(WIN + "_orig", label="Also save original Arnold frame as PNG", value=True)
-    cmds.checkBox(WIN + "_dbg", label="Save debug images (compare, change map, DLSS inputs) in output/debug", value=False)
+    cmds.checkBox(WIN + "_orig", label="Also save original Arnold frame as PNG", value=True,
+                  annotation="Saves Arnold's own render (through your view transform) next to the DLSS 5 "
+                             "result, so you can flip between them.")
+    cmds.checkBox(WIN + "_dbg", label="Save debug images (compare, change map, DLSS inputs) in output/debug", value=False,
+                  annotation="Per frame: compare = original | DLSS 5; diff = where DLSS 5 changed things locally "
+                             "(heat map); inputs = what DLSS 5 received (colour | depth | motion vectors).")
+    cmds.checkBox(WIN + "_show", label="Show result in a viewer window when done (stays open; also for the shelf)",
+                  value=_show_result_enabled(),
+                  changeCommand=lambda v: cmds.optionVar(intValue=(_SHOW_VAR, int(bool(v)))),
+                  annotation="Opens the result in FCheck when finished (sequences play as an animation). "
+                             "Remembered between sessions and also used by the shelf Render button.")
     cmds.separator(height=6)
-    cmds.button(WIN + "_go", label="Process Current Frame", height=32, command=_on_current)
+    cmds.button(WIN + "_go", label="Process Current Frame", height=32, command=_on_current,
+                annotation="Renders the current frame with Arnold, runs DLSS 5 and shows it in the Render View. "
+                           "A helper window appears for a few seconds - leave it alone.")
     cmds.intFieldGrp(WIN + "_rng", label="Frame range", numberOfFields=2, value1=start, value2=end,
-                     columnWidth3=(80, 60, 60))
+                     columnWidth3=(80, 60, 60),
+                     annotation="First and last frame for Process Frame Range.")
     cmds.checkBox(WIN + "_stab", label="Stabilise frame ranges (reduces DLSS 5 wobble, uses motion vectors)",
-                  value=True)
-    cmds.button(WIN + "_range", label="Process Frame Range (render + DLSS 5)", command=_on_range)
-    cmds.floatFieldGrp(WIN + "_near", label="Near clip", value1=near, precision=4, columnWidth2=(80, 80))
-    cmds.button(WIN + "_seq", label="Process EXR Sequence...", command=_on_sequence)
+                  value=True,
+                  annotation="DLSS 5 re-invents fine detail every frame, which wobbles. This carries the "
+                             "change along Arnold's exact motion vectors (about 30% less wobble on faces).")
+    cmds.button(WIN + "_range", label="Process Frame Range (render + DLSS 5)", command=_on_range,
+                annotation="Renders the range with a Z pass and motion vectors, runs DLSS 5 over it in order, "
+                           "then stabilises. Long shots are processed in chunks to limit disk use.")
+    cmds.floatFieldGrp(WIN + "_near", label="Near clip", value1=near, precision=4, columnWidth2=(80, 80),
+                       annotation="Camera near clip used to encode depth for existing EXR sequences. "
+                                  "Scene renders use the render camera's own value.")
+    cmds.button(WIN + "_seq", label="Process EXR Sequence...", command=_on_sequence,
+                annotation="Pick any frame of an already-rendered EXR sequence (needs a Z channel; flat depth "
+                           "is offered otherwise). Your EXR files are never changed.")
     cmds.rowLayout(numberOfColumns=2, adjustableColumn=1)
-    cmds.button(label="Open Output Folder", command=_on_open)
-    cmds.button(label="Cancel", command=lambda *_: cancel())
+    cmds.button(label="Open Output Folder", command=_on_open, annotation="Opens the Folder above in Explorer.")
+    cmds.button(label="Cancel", command=lambda *_: cancel(),
+                annotation="Stops the running job (Arnold render or DLSS 5 pass).")
     cmds.setParent("..")
-    cmds.text(WIN + "_status", label="Ready.", align="left")
+    cmds.text(WIN + "_status", label="Ready.", align="left", annotation="Progress of the current job.")
     cmds.showWindow(WIN)

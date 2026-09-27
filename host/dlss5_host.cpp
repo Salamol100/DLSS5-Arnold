@@ -276,6 +276,35 @@ static uint8_t Quantize8(float v)
 
 // displayReferred: colour is already view-transformed and sRGB-encoded (0..1), e.g. Arnold's
 // ACES output-transform PNG; it is only quantised, not encoded again.
+// Upscale mode (--upscale S): the input is a low-resolution render; it is resampled to S x its size
+// (colour bilinear, depth nearest) so the back buffer is the OUTPUT size. The feed is then run at
+// a work resolution of 100/S % with work_upscale=1 (dlss5-feed.cfg, set by the caller), so DLSS
+// rebuilds full resolution from the low-res image before the neural pass.
+static int g_upscale = 1;
+
+static void Upscale(Image& img, int s, bool nearest)
+{
+    if (s <= 1) return;
+    const int w = img.w * s, h = img.h * s, c = img.c;
+    std::vector<float> out((size_t)w * h * c);
+    for (int y = 0; y < h; ++y) {
+        const float sy = nearest ? (float)(y / s) : std::max(0.f, (y + 0.5f) / s - 0.5f);
+        const int y0 = std::min((int)sy, img.h - 1), y1 = std::min(y0 + 1, img.h - 1);
+        const float fy = nearest ? 0.f : sy - y0;
+        for (int x = 0; x < w; ++x) {
+            const float sx = nearest ? (float)(x / s) : std::max(0.f, (x + 0.5f) / s - 0.5f);
+            const int x0 = std::min((int)sx, img.w - 1), x1 = std::min(x0 + 1, img.w - 1);
+            const float fx = nearest ? 0.f : sx - x0;
+            for (int ch = 0; ch < c; ++ch) {
+                auto at = [&](int xx, int yy) { return img.px[((size_t)yy * img.w + xx) * c + ch]; };
+                out[((size_t)y * w + x) * c + ch] =
+                    (at(x0, y0) * (1 - fx) + at(x1, y0) * fx) * (1 - fy) + (at(x0, y1) * (1 - fx) + at(x1, y1) * fx) * fy;
+            }
+        }
+    }
+    img.w = w; img.h = h; img.px.swap(out);
+}
+
 static bool LoadFrame(const Job& job, float nearZ, float gain, bool displayReferred, int& W, int& H,
                       std::vector<uint8_t>& rgba, std::vector<float>& rz)
 {
@@ -286,6 +315,8 @@ static bool LoadFrame(const Job& job, float nearZ, float gain, bool displayRefer
                 color.w, color.h, color.c, depth.w, depth.h, depth.c);
         return false;
     }
+    Upscale(color, g_upscale, false);
+    Upscale(depth, g_upscale, true);
     if (W && (color.w != W || color.h != H)) {
         fprintf(stderr, "[host] %s is %dx%d, sequence is %dx%d\n", job.color.c_str(), color.w, color.h, W, H);
         return false;
@@ -328,6 +359,7 @@ int main(int argc, char** argv)
     const float gain     = powf(2.f, exposure);
     const bool  display  = atoi(Arg(argc, argv, "--display-referred", "0")) != 0;
     g_hdr = atoi(Arg(argc, argv, "--hdr", "0")) != 0;
+    g_upscale = std::max(1, std::min(4, atoi(Arg(argc, argv, "--upscale", "1"))));
     const DXGI_FORMAT colorFmt = g_hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     const UINT colorBpp = g_hdr ? 8 : 4;
     const float mvScale  = (float)atof(Arg(argc, argv, "--mv-scale", "2"));

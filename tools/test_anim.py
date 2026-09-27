@@ -39,7 +39,7 @@ preset_path = os.path.join(de.RUNTIME, "ReShadePreset.ini")
 preset_orig = open(preset_path).read()
 runs = {}
 try:
-    de.write_settings(0.98, 2.0, "Natural")  # overwritten below: NRStyle=0 is what we want
+    de.write_settings(0.98, 2.0, "Default")  # NRStyle=0; set explicitly below as well
     txt = re.sub(r"(?m)^NRStyle=.*$", "NRStyle=0", open(de.INI).read())
     open(de.INI, "w").write(txt)
     for tag, use_mv in (("zero", False), ("arnold", True)):

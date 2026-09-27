@@ -13,6 +13,22 @@
 > shift were artefacts of the wrong input. **Re-test the ammonite scene** with the shelf's
 > Render button before drawing conclusions.
 
+## Test 8: settings beyond the UI, DLSS model presets, upscaling, Detail-only (head scene)
+
+- **Beyond UI ranges:** Intensity 1.5/2 (+0.0006), Skin Structure 3 = 5 (+0.003), Structure 4 (0). The model
+  clamps them, and the UI ranges are already at the limit. Others report the same Intensity clamp
+  (github.com/Blueforcer/ComfyUI-DLSS5-Enhancer). Only **Passes** pushes further.
+- **DLSS model preset** (dlss5-feed.cfg `preset`): J/K = Default (face detail 0.0214 / 0.0212). L/M are slightly
+  softer (0.0202), and the feed log shows `(?)` for them on DLSS 310.8. Kept at Default.
+- **Upscaling** (half-res render, feed work_resolution 50 + work_upscale): the NR runs at the *low* resolution and
+  the feed enlarges it with FSR1. Face detail 0.0112 vs 0.0212 at full res; plain resize gives 0.0097. RenoDX's
+  NREnableUpscaling had no effect (it needs a DLSS preset forced in the NVIDIA App). **Not worth it.**
+- On the well-exposed head, full-res DLSS 5 adds **+20% face detail** over Arnold (0.0176 -> 0.0212).
+- **Detail only** (`detail_only()`: Arnold low frequencies x DLSS high-frequency ratio, split 3 px): broad
+  colour/lighting change vs Arnold 0.003 (full DLSS 0.024), with face detail 0.0228 (full DLSS 0.0212). This
+  removes the "game/photogrammetry" regrade and keeps the skin detail.
+- Isolated eyeballs (no face): DLSS 5 barely changes them (0.004). The character path needs a face.
+
 ## Test 7: a character (the key result)
 
 **Input:** the user's stylised anime-girl head, in the live Maya scene (untitled, persp, 960×540, Arnold AA 3), driven through the Maya command port 6111 with `process_scene_frames` and the game's exact settings.
