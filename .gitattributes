@@ -1,0 +1,4 @@
+# Maya ASCII scenes are not Mathematica/Wolfram (GitHub guesses that from .ma); keep them out of
+# the language stats.
+*.ma linguist-detectable=false
+*.ma linguist-language=Text

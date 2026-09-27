@@ -82,6 +82,6 @@ Implementation was written with Claude (Anthropic) as a coding assistant.
 
 ## Licence and credits
 
-The code in this repository is © Biscuit Beetle. Add a `LICENSE` file before publishing.
+The code in this repository is © Biscuit Beetle, released under the [MIT licence](LICENSE).
 `host/third_party/reshade/include` holds the ReShade 6.8.0 add-on API headers (BSD-3-Clause OR MIT, © Patrick Mours; see their `LICENSE.md`).
 DLSS, NGX and the DLSS 5 runtime are NVIDIA's. ReShade, DLSS5-Feeder, RenoDX and LumeniteFX belong to their respective authors. None of their binaries or shaders are included here.
