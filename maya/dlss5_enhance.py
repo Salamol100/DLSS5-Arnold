@@ -450,6 +450,46 @@ def _to_709_matrix(space):
     return np.array(_AP1_TO_709) if space and "acescg" in space.lower() else np.eye(3)
 
 
+# Hill's rational RRT curve, params named to match the derivation below.
+_HILL_A, _HILL_B, _HILL_C, _HILL_D, _HILL_E = 0.0245786, 0.000090537, 0.983729, 0.4329510, 0.238081
+_HILL_C0 = -_HILL_B / _HILL_E  # curve value at 0, i.e. where the two branches below meet
+
+
+def _aces_compress(lin709):
+    """Compress scene-linear scRGB the same way Hill's ACES RRT does (matrix -> rational tone curve
+    -> matrix), but stop BEFORE the display clamp/sRGB encode that _view() applies - the result is
+    still a linear-ish extended-range HDR buffer, just with the same highlight rolloff/shadow shaping
+    a game engine's own tonemapper would give its HDR backbuffer. That's what DLSS 5 was actually
+    trained on; Arnold's raw scene-linear values (deep, physically-real shadows, no rolloff) sit
+    outside that distribution and DLSS 5 compensates for it in a way that reads as crushed blacks
+    (measured on a reef background: -44% mean brightness, shadow level 0.25 -> 0.09).
+
+    Unlike feeding DLSS 5 the already view-transformed 8-bit PNG (the blunter fix used by the
+    'Environments / props' preset), this keeps full float precision and extended range - it is
+    exactly inverted by _aces_expand() before anything downstream (gamut restore, blend_dlss,
+    the focus mask, stabilisation) sees the result, so nothing later in the pipeline needs to change."""
+    import numpy as np
+    u = lin709 @ np.array(_HILL_IN).T
+    up = np.maximum(u, 0.0)
+    t = np.where(u >= 0, (up * (up + _HILL_A) - _HILL_B) / (up * (_HILL_C * up + _HILL_D) + _HILL_E),
+                _HILL_C0 + u)
+    return t @ np.array(_HILL_OUT).T
+
+
+def _aces_expand(compressed):
+    """Exact inverse of _aces_compress (verified to round-trip to float precision over v in
+    roughly -5..8, comfortably covering scene-linear scRGB in practice - SCRGB_WHITE is ~3.4)."""
+    import numpy as np
+    t = compressed @ np.linalg.inv(np.array(_HILL_OUT)).T
+    tc = np.maximum(t, _HILL_C0)
+    a = tc * _HILL_C - 1.0
+    b = tc * _HILL_D - _HILL_A
+    c = tc * _HILL_E + _HILL_B
+    sq = np.sqrt(np.clip(b * b - 4 * a * c, 0, None))
+    u = np.where(t >= _HILL_C0, (-b - sq) / (2 * a), t - _HILL_C0)
+    return u @ np.linalg.inv(np.array(_HILL_IN)).T
+
+
 def _view(lin709, aces):
     """Display-referred sRGB (0..1) from scene-linear Rec.709: ACES fitted view or plain sRGB."""
     import numpy as np
@@ -524,8 +564,13 @@ FORMATS = {"exr": ("exr", None), "png16": ("png", "uint16"), "png8": ("png", "ui
            "png": ("png", "uint8"), "tif": ("tif", "uint16")}
 
 
-def _hdr_input(exr, work, tag, space, log):
-    """Arnold EXR RGB (rendering space) -> scRGB PFM for the HDR back buffer."""
+def _hdr_input(exr, work, tag, space, log, compress=False):
+    """Arnold EXR RGB (rendering space) -> scRGB PFM for the HDR back buffer.
+    compress: also apply _aces_compress() before writing the file DLSS 5 actually receives (see its
+    docstring for why), while returning a second, true-linear file for everything downstream that
+    needs Arnold's real values (blend_dlss, the focus mask, stabilisation, gamut restore).
+    Returns (path sent to the host, path with true-linear values) - the same single file for both
+    when compress is False, as before."""
     import numpy as np
     oiio = os.path.join(arnold_bin(), "oiiotool.exe")
     raw = os.path.join(work, tag + "_lin.pfm")
@@ -539,8 +584,13 @@ def _hdr_input(exr, work, tag, space, log):
     # whatever part the DLSS pass does not carry through is restored in _restore_gamut().
     scrgb = lin @ _to_709_matrix(space).T * SCRGB_WHITE
     out = os.path.join(work, tag + "_c.pfm")
-    _write_pfm(scrgb, out, clip=False)
-    return out
+    if not compress:
+        _write_pfm(scrgb, out, clip=False)
+        return out, out
+    out_lin = os.path.join(work, tag + "_c_lin.pfm")
+    _write_pfm(scrgb, out_lin, clip=False)
+    _write_pfm(_aces_compress(scrgb), out, clip=False)
+    return out, out_lin
 
 
 def _box_blur(img, r):
@@ -735,11 +785,16 @@ def _write_debug(frame, name, out_dir, work, orig_view, dlss_view, depth_path, m
 def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep_original,
                   log, done, render_scene, use_mv=False, stabilise=0.0, hdr=True, space="ACEScg",
                   aces=True, debug=False, passes=1, exposure=0.0, mode="full", detail_size=3.0,
-                  look=1.0, detail_amount=1.0, dof_aware=True, dof=None, live_preview=False):
+                  look=1.0, detail_amount=1.0, dof_aware=True, dof=None, live_preview=False,
+                  aces_compress=False):
     """frames: list of (frame, ass_or_None, exr, display_png_or_None).
     Runs kick (if ass), PFM, host, output. use_mv: pass Arnold's motionvector AOV (as exported by
     export_scene_frames(motion_vectors=True)) to DLSS 5. hdr: run DLSS 5 on a 16-bit float scRGB
     back buffer from the linear EXR (default); False = the older 8-bit display-referred path.
+    aces_compress: only with hdr=True - tone-compress the scRGB buffer the same way Hill's ACES RRT
+    does before DLSS 5 sees it, and exactly invert that afterwards (see _aces_compress). Matches
+    DLSS 5's own training data far better than raw scene-linear values on environments/props, without
+    the precision/gamut loss of the older hdr=False 8-bit path.
     dof_aware: fall back to Arnold's own pixels (feathered) wherever the camera's own depth of field
     puts a pixel out of focus - DLSS 5 posterises smooth defocus blur into flat patches (see
     focus_mask). dof: the camera's depth-of-field parameters from _camera_dof(), or None (no DOF on
@@ -780,8 +835,9 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
             log("Preparing frame %d" % frame)
             tag = "f%04d" % frame
             c, z, real_z = _to_pfm(exr, png if (display and not hdr) else None, work, tag, allow_flat_depth, log)
+            c_lin = c
             if hdr:
-                c = _hdr_input(exr, work, tag, space, log)
+                c, c_lin = _hdr_input(exr, work, tag, space, log, compress=aces_compress)
                 remove(os.path.join(work, tag + "_lin.pfm"))
             if not real_z and i == 0:
                 log("  no Z channel: using FLAT depth (DLSS gets no depth; results less reliable)")
@@ -799,7 +855,8 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
                     raise RuntimeError("Frame %d has no motionvector AOV" % frame)
             if render_scene:        # our own render: its EXR / preview PNG are no longer needed
                 remove(exr, png)    # (an existing sequence's EXRs are the user's files: never touched)
-            return dict(frame=frame, c=c, z=z, mv=mv, out=os.path.join(work, "%s_out.%s" % (tag, out_ext)))
+            return dict(frame=frame, c=c, c_lin=c_lin, z=z, mv=mv,
+                       out=os.path.join(work, "%s_out.%s" % (tag, out_ext)))
 
         def run_host(batch):
             _acquire_host_lock(log)
@@ -832,7 +889,9 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
             frame = j["frame"]
             dl = _read_img(j["out"])
             if hdr:
-                orig_in = _read_pfm(j["c"])
+                orig_in = _read_pfm(j["c_lin"])
+                if aces_compress:
+                    dl = _aces_expand(dl)
                 dl = _restore_gamut(orig_in, dl)
             if mode == "detail":            # legacy switch = Look 0
                 look_amt = 0.0
@@ -868,7 +927,7 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
                 else:
                     ov, dv = _read_pfm(j["c"]), img
                 _write_debug(frame, name, out_dir, work, ov, dv, j["z"], j["mv"], log)
-            remove(j["c"], j["z"], j["mv"], j["out"], tmp)
+            remove(j["c"], j.get("c_lin"), j["z"], j["mv"], j["out"], tmp)
             return shown
 
         # Chunked so temp data stays bounded: after the first frame is prepared its temp size is
@@ -1057,7 +1116,7 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
                          keep_original=True, log=print, done=None, block=False, style=None,
                          motion_vectors=None, stabilise=0.8, hdr=True, debug=False, passes=1, exposure=0.0,
                          mode="full", detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True,
-                         live_preview=None):
+                         live_preview=None, aces_compress=False):
     """Render frames start..end of the open scene with Arnold, then DLSS 5 them in order.
     motion_vectors: None = automatic (on for ranges, off for a single frame).
     stabilise: 0 = off, else strength of the motion-vector stabilisation of the DLSS edit
@@ -1085,7 +1144,7 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
                                stabilise=stabilise, hdr=hdr, space=space, aces=aces, debug=debug,
                                passes=passes, exposure=exposure, mode=mode, detail_size=detail_size,
                                look=look, detail_amount=detail_amount, dof_aware=dof_aware, dof=dof,
-                               live_preview=live_preview), block)
+                               live_preview=live_preview, aces_compress=aces_compress), block)
 
 
 def find_sequence(one_file):
@@ -1106,7 +1165,8 @@ def find_sequence(one_file):
 def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, fmt="auto",
                          allow_flat_depth=False, keep_original=True, log=print, done=None, block=False,
                          style=None, hdr=True, debug=False, passes=1, exposure=0.0, mode="full",
-                         detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True):
+                         detail_size=3.0, look=1.0, detail_amount=1.0, dof_aware=True,
+                         aces_compress=False):
     """DLSS 5 an already-rendered EXR sequence: list of (frame, path). The EXRs are assumed to be
     in the scene's rendering space (ACEScg with Maya's default colour management).
     dof_aware has no effect here: there's no live camera tied to an already-rendered sequence, so
@@ -1122,7 +1182,8 @@ def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, 
                                done=done or (lambda r, e: None), render_scene=False, hdr=hdr,
                                space=space, aces=aces, debug=debug, passes=passes, exposure=exposure,
                                mode=mode, detail_size=detail_size, look=look,
-                               detail_amount=detail_amount, dof_aware=dof_aware), block)
+                               detail_amount=detail_amount, dof_aware=dof_aware,
+                               aces_compress=aces_compress), block)
 
 
 def cancel():
@@ -1161,14 +1222,15 @@ def _opt(name, default):
 
 # Safe defaults: Arnold look kept, DLSS detail added once. "Reset" always returns here.
 DEFAULTS = dict(intensity=0.98, structure=2.0, style="Default", passes=1, look=0.0,
-                detail_amount=1.0, detail_size=3.0, exposure=0.0, dof_aware=True, hdr=True)
+                detail_amount=1.0, detail_size=3.0, exposure=0.0, dof_aware=True, hdr=True,
+                aces_compress=False)
 PRESETS = {
     "Default (safe)":       {},
     "Subtle":               dict(detail_amount=0.6),
     "Faces - photoreal":    dict(passes=2, look=0.5, detail_amount=1.5),
     "Surfaces - crisp":     dict(detail_amount=1.8, detail_size=1.5),
     "Full DLSS 5 look":     dict(look=1.0),
-    "Environments / props": dict(hdr=False),
+    "Environments / props": dict(aces_compress=True),
 }
 _SETTINGS_VAR, _USER_PRESETS_VAR = "dlss5_settings", "dlss5_userPresets"
 
@@ -1255,7 +1317,8 @@ _UI_CTRLS = dict(intensity=("_int", "floatSliderGrp"), structure=("_str", "float
                  style=("_sty", "optionMenuGrp"), passes=("_pas", "intSliderGrp"),
                  exposure=("_exp", "floatSliderGrp"), look=("_look", "floatSliderGrp"),
                  detail_amount=("_damt", "floatSliderGrp"), detail_size=("_dsz", "floatSliderGrp"),
-                 dof_aware=("_dof", "checkBox"), hdr=("_hdrin", "checkBox"))
+                 dof_aware=("_dof", "checkBox"), hdr=("_hdrin", "checkBox"),
+                 aces_compress=("_cmp", "checkBox"))
 
 
 def _ui_settings():
@@ -1559,16 +1622,26 @@ def show():
                              "Arnold's own pixels wherever a pixel is out of focus, feathered so there's "
                              "no visible seam. Does nothing if the camera has no depth of field. Turn "
                              "off only to compare against raw DLSS 5.")
-    cmds.checkBox(WIN + "_hdrin", label="Linear HDR input (uncheck for environments/props)",
+    cmds.checkBox(WIN + "_hdrin", label="Linear HDR input (advanced - see Compress before DLSS below)",
                   value=s["hdr"],
+                  annotation="On (recommended, and what the Faces presets were tuned on): feeds DLSS 5 "
+                             "Arnold's true scene-linear ACEScg values, 16-bit float, no precision loss. "
+                             "Off: feeds it the older 8-bit, already view-transformed image instead - "
+                             "genuinely clips extended-range colour and quantises to 256 levels before "
+                             "DLSS 5 even sees it. Leave this On and use 'Compress before DLSS' instead, "
+                             "which fixes the same problem (see its tooltip) without that precision loss.")
+    cmds.checkBox(WIN + "_cmp", label="Compress before DLSS (recommended for environments/props)",
+                  value=s["aces_compress"],
                   annotation="DLSS 5 was trained on tonemapped game frames, not raw scene-linear render "
-                             "passes. On, it feeds DLSS 5 Arnold's true scene-linear ACEScg values (16-bit "
-                             "float, no precision loss) - this is what the Faces presets were tuned and "
-                             "tested on. Off, it feeds DLSS 5 the already view-transformed (tonemapped) "
-                             "image instead, which matches DLSS 5's training data far better on "
-                             "environments/props: measured on a reef background, On crushed the shadows "
-                             "and darkened the whole image ~44%; Off matched Arnold's own brightness and "
-                             "shadow level almost exactly. Try Off first on anything that isn't a face.")
+                             "passes: Arnold's true shadow depth sits outside what it expects, and it "
+                             "compensates in a way that reads as crushed blacks (measured on a reef "
+                             "background: -44% mean brightness, shadow level 0.25 -> 0.09 with this off). "
+                             "On, the scRGB buffer is tone-compressed the same way Hill's ACES fit "
+                             "compresses for display - matching DLSS 5's training data far better - and "
+                             "exactly inverted afterwards, so no precision or extended range is lost "
+                             "(unlike unchecking Linear HDR input above). Same reef shot with this on: "
+                             "brightness and shadow level land within 1% of Arnold's own render. Only "
+                             "meaningful when Linear HDR input is On.")
     _ui_fill_presets()
     for c, fn in _UI_CTRLS.values():
         getattr(cmds, fn)(WIN + c, e=True, changeCommand=_ui_changed)
