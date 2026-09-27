@@ -1,0 +1,22 @@
+# Proprietary / third-party binaries: users supply their own (see README)
+runtime/*.dll
+runtime/*.addon64
+runtime/*.addon32
+runtime/dlss5-feed.cfg
+runtime/reshade-shaders/
+runtime/reshade-cache/
+runtime/ReShade.ini
+runtime/ReShadePreset.ini
+runtime/*.log
+runtime/*.log1
+runtime/host.lock
+runtime/dlss5_host.exe
+
+# build / run output
+host/obj/
+work/
+test/*/
+*.pfm
+*.ppm
+*.exr
+__pycache__/

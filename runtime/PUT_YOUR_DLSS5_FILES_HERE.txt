@@ -1,0 +1,4 @@
+Copy your own DLSS 5 runtime here (see README.md > Setup):
+dxgi.dll (ReShade 6.8), dlss5-feed.addon64 + dlss5-feed.cfg, renodx-dlss5.addon64,
+nvngx_dlss.dll, nvngx_dlssnr.dll, reshade-shaders/Shaders/{DLSS5_Feed.fx, ReShade.fxh, ReShadeUI.fxh}.
+Then build host/build.bat (writes dlss5_host.exe here) and rename the .template files.

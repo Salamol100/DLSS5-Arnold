@@ -1,0 +1,10 @@
+
+Techniques=DLSS5_Feed@DLSS5_Feed.fx
+
+TechniqueSorting=DLSS5_Feed@DLSS5_Feed.fx
+
+PreprocessorDefinitions=DLSS5_MV_PROVIDER=0
+
+[DLSS5_Feed.fx]
+PreprocessorDefinitions=DLSS5_MV_PROVIDER=0
+MV_VALIDATE=0
