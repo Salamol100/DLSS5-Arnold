@@ -476,9 +476,41 @@ def _aces_compress(lin709):
     return t @ np.array(_HILL_OUT).T
 
 
+_AECS_LUT = None
+
+
+def _aces_curve_inverse_lut():
+    """A dense, monotonic (u -> t) table for the elementwise curve in _aces_compress, built once.
+    Used instead of the exact closed-form inverse: that formula divides by (t*_HILL_C - 1), which
+    real DLSS 5 output pushes to within 0.01 of zero for about 1.6% of pixels on a real frame
+    (measured), blowing a tiny numerical error up into a huge, wrong colour - this showed up as
+    small rainbow blobs on frames with 'Compress before DLSS' on (confirmed: identical settings
+    with it off had none). A LUT lookup is bounded by construction: no division, and out-of-range
+    queries clamp to the table's edge instead of exploding."""
+    global _AECS_LUT
+    if _AECS_LUT is None:
+        import numpy as np
+        u = np.linspace(-8.0, 14.0, 20000)
+        up = np.maximum(u, 0.0)
+        t = np.where(u >= 0, (up * (up + _HILL_A) - _HILL_B) / (up * (_HILL_C * up + _HILL_D) + _HILL_E),
+                    _HILL_C0 + u)
+        _AECS_LUT = (t, u)  # t is increasing since the curve is monotonic - required by np.interp
+    return _AECS_LUT
+
+
 def _aces_expand(compressed):
-    """Exact inverse of _aces_compress (verified to round-trip to float precision over v in
-    roughly -5..8, comfortably covering scene-linear scRGB in practice - SCRGB_WHITE is ~3.4)."""
+    """Inverse of _aces_compress via the bounded LUT above (see _aces_curve_inverse_lut)."""
+    import numpy as np
+    t = compressed @ np.linalg.inv(np.array(_HILL_OUT)).T
+    t_grid, u_grid = _aces_curve_inverse_lut()
+    u = np.interp(t, t_grid, u_grid)
+    return u @ np.linalg.inv(np.array(_HILL_IN)).T
+
+
+def _aces_expand_exact(compressed):
+    """The original closed-form inverse (exact but numerically unstable near t*_HILL_C == 1 - see
+    _aces_curve_inverse_lut). Kept only for the round-trip test in tools/; _aces_expand is what the
+    pipeline actually uses."""
     import numpy as np
     t = compressed @ np.linalg.inv(np.array(_HILL_OUT)).T
     tc = np.maximum(t, _HILL_C0)
