@@ -61,6 +61,7 @@ Maya never loads ReShade. The DLSS work happens in a separate helper process (`r
 - **Strength:** 0.25 keeps a stylised character's design and adds realistic skin. 0.98 is a full photoreal re-interpretation.
 - **Frame ranges** use Arnold's exact motion vectors plus temporal stabilisation, which gives about 30% less "wobble" on faces.
 - **Output:** Auto (single frame → PNG 16-bit, ranges → half-float EXR in the rendering space + 8-bit preview), or EXR / PNG16 / PNG8.
+- **Debug images** (Panel checkbox, off by default): per frame, `compare` (original | DLSS 5), `diff` (where DLSS 5 changed things locally, with the overall colour shift removed) and `inputs` (what DLSS 5 received: colour | depth | motion vectors). They're written to `output/debug`.
 - **Disk:** frames are processed in chunks sized to your free space, and temp files are deleted per frame.
 
 ## Batch / render farm

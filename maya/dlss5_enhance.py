@@ -508,9 +508,66 @@ def _write_outputs(img_scrgb, frame, name, out_dir, work, fmt, space, aces, log)
     return dst
 
 
+def _heat(x):
+    """0..1 scalar -> black/red/yellow/white heat colours."""
+    import numpy as np
+    x = np.clip(x, 0, 1)[..., None]
+    return np.concatenate([np.clip(3 * x, 0, 1), np.clip(3 * x - 1, 0, 1), np.clip(3 * x - 2, 0, 1)], axis=2)
+
+
+def _write_debug(frame, name, out_dir, work, orig_view, dlss_view, depth_path, mv_path, log):
+    """Debug images for one frame, in <out_dir>/debug:
+      *_compare  : original | DLSS 5 side by side (display-referred)
+      *_diff     : where DLSS 5 changed the image (luma difference x5, heat colours)
+      *_inputs   : what DLSS 5 received - colour | depth (near = bright) | motion vectors
+                   (hue = direction, brightness = speed; black = none)
+    """
+    import numpy as np
+    oiio = os.path.join(arnold_bin(), "oiiotool.exe")
+    ddir = os.path.join(out_dir, "debug")
+    os.makedirs(ddir, exist_ok=True)
+    tmp = os.path.join(work, "f%04d_dbg.pfm" % frame)
+
+    def save(img, suffix):
+        _write_pfm(img, tmp)
+        _run([oiio, tmp, "-d", "uint8", "-o", os.path.join(ddir, "%s_%s.%04d.png" % (name, suffix, frame))], log)
+
+    save(np.concatenate([orig_view, dlss_view], axis=1), "compare")
+    # Change map: DLSS 5 also shifts the overall colour slightly everywhere, which would light up
+    # the whole map. Match the DLSS image's per-channel mean/contrast to the original first, so
+    # only LOCAL changes (re-invented detail, relit areas) remain; scale to the 99th percentile.
+    matched = np.empty_like(dlss_view)
+    for ch in range(3):
+        o, d = orig_view[..., ch], dlss_view[..., ch]
+        matched[..., ch] = (d - d.mean()) / (d.std() + 1e-6) * o.std() + o.mean()
+    local = np.mean(np.abs(matched - orig_view), axis=2)
+    save(_heat(local / max(np.percentile(local, 99), 1e-6)), "diff")
+
+    z = _read_pfm(depth_path)[..., 0]
+    hit = (z > 0) & (z < 1e20)
+    dv = np.zeros_like(z)
+    if hit.any():
+        inv = np.where(hit, 1.0 / np.maximum(z, 1e-6), 0.0)
+        lo, hi = np.percentile(inv[hit], 1), np.percentile(inv[hit], 99)
+        dv = np.where(hit, np.clip((inv - lo) / max(hi - lo, 1e-9), 0, 1), 0.0)
+    depth_img = np.repeat(dv[..., None], 3, axis=2)
+    panels = [orig_view, depth_img]
+    if mv_path:
+        mv = _read_pfm(mv_path)
+        dx, dy = mv[..., 0] * 2, mv[..., 1] * 2  # pixels per frame (see LoadMV / test_mv.py)
+        mag = np.hypot(dx, dy)
+        ang = (np.arctan2(dy, dx) / (2 * np.pi)) % 1.0
+        v = np.clip(mag / max(np.percentile(mag, 99), 1e-6), 0, 1)
+        h6 = ang * 6
+        c = np.stack([np.clip(np.abs(h6 - 3) - 1, 0, 1), np.clip(2 - np.abs(h6 - 2), 0, 1),
+                      np.clip(2 - np.abs(h6 - 4), 0, 1)], axis=2)
+        panels.append(c * v[..., None])
+    save(np.concatenate(panels, axis=1), "inputs")
+
+
 def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep_original,
                   log, done, render_scene, use_mv=False, stabilise=0.0, hdr=True, space="ACEScg",
-                  aces=True):
+                  aces=True, debug=False):
     """frames: list of (frame, ass_or_None, exr, display_png_or_None).
     Runs kick (if ass), PFM, host, output. use_mv: pass Arnold's motionvector AOV (as exported by
     export_scene_frames(motion_vectors=True)) to DLSS 5. hdr: run DLSS 5 on a 16-bit float scRGB
@@ -618,6 +675,13 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
                 _write_pfm(img, tmp)
                 if _run([oiio, tmp, "-d", depth, "-o", shown], log)[0] != 0:
                     raise RuntimeError("Could not write " + shown)
+            if debug:
+                if hdr:
+                    ov = _view(orig_in / SCRGB_WHITE, aces)
+                    dv = _view(img / SCRGB_WHITE, aces)
+                else:
+                    ov, dv = _read_pfm(j["c"]), img
+                _write_debug(frame, name, out_dir, work, ov, dv, j["z"], j["mv"], log)
             remove(j["c"], j["z"], j["mv"], j["out"], tmp)
             return shown
 
@@ -685,9 +749,31 @@ def _folder_in_use(path):
 _HOST_LOCK = os.path.join(RUNTIME, "host.lock")
 
 
+def _helper_running():
+    """True if any dlss5_host.exe process exists."""
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq dlss5_host.exe", "/NH"],
+                             capture_output=True, text=True, creationflags=_NO_WINDOW).stdout
+        return "dlss5_host.exe" in out.lower()
+    except OSError:
+        return True  # can't tell: assume busy, the owner-alive test still applies
+
+
+def _lock_is_stale(owner):
+    """A lock is stale if its owner process is gone, or if no DLSS helper has been running for a
+    while even though the owner is still alive (e.g. Maya kept open after an aborted job)."""
+    if not owner or not _pid_alive(owner):
+        return True
+    try:
+        age = time.time() - os.path.getmtime(_HOST_LOCK)
+    except OSError:
+        return True
+    return age > 20 and not _helper_running()
+
+
 def _acquire_host_lock(log):
     """One DLSS 5 helper at a time across processes (Maya + batch jobs share runtime/ and its
-    ReShade.ini). A lock whose owner process is gone is taken over."""
+    ReShade.ini). A stale lock (see _lock_is_stale) is taken over."""
     waited = False
     while True:
         try:
@@ -701,7 +787,7 @@ def _acquire_host_lock(log):
                     owner = int(f.read().strip() or 0)
             except (IOError, ValueError):
                 owner = 0
-            if owner == os.getpid() or not owner or not _pid_alive(owner):
+            if owner == os.getpid() or _lock_is_stale(owner):
                 try:
                     os.remove(_HOST_LOCK)
                 except OSError:
@@ -783,7 +869,7 @@ def _resolve_fmt(fmt, n_frames):
 
 def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt="auto",
                          keep_original=True, log=print, done=None, block=False, style=None,
-                         motion_vectors=None, stabilise=0.8, hdr=True):
+                         motion_vectors=None, stabilise=0.8, hdr=True, debug=False):
     """Render frames start..end of the open scene with Arnold, then DLSS 5 them in order.
     motion_vectors: None = automatic (on for ranges, off for a single frame).
     stabilise: 0 = off, else strength of the motion-vector stabilisation of the DLSS edit
@@ -800,7 +886,7 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
     _start(_run_pipeline, dict(frames=frames, out_dir=out_dir, name=name, fmt=fmt, near=near, work=work,
                                allow_flat_depth=False, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=True, use_mv=use_mv,
-                               stabilise=stabilise, hdr=hdr, space=space, aces=aces), block)
+                               stabilise=stabilise, hdr=hdr, space=space, aces=aces, debug=debug), block)
 
 
 def find_sequence(one_file):
@@ -820,7 +906,7 @@ def find_sequence(one_file):
 
 def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, fmt="auto",
                          allow_flat_depth=False, keep_original=True, log=print, done=None, block=False,
-                         style=None, hdr=True):
+                         style=None, hdr=True, debug=False):
     """DLSS 5 an already-rendered EXR sequence: list of (frame, path). The EXRs are assumed to be
     in the scene's rendering space (ACEScg with Maya's default colour management)."""
     write_settings(intensity, structure, style)
@@ -832,7 +918,7 @@ def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, 
     _start(_run_pipeline, dict(frames=frames, out_dir=out_dir, name=name, fmt=fmt, near=near, work=work,
                                allow_flat_depth=allow_flat_depth, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=False, hdr=hdr,
-                               space=space, aces=aces), block)
+                               space=space, aces=aces, debug=debug), block)
 
 
 def cancel():
@@ -884,6 +970,7 @@ def _ui_vals():
         out_dir=cmds.textFieldButtonGrp(WIN + "_out", q=True, text=True),
         fmt=_UI_FORMATS[cmds.optionMenuGrp(WIN + "_fmt", q=True, value=True)],
         keep_original=cmds.checkBox(WIN + "_orig", q=True, value=True),
+        debug=cmds.checkBox(WIN + "_dbg", q=True, value=True),
     )
 
 
@@ -1058,6 +1145,7 @@ def show():
     for f in _UI_FORMATS:
         cmds.menuItem(label=f)
     cmds.checkBox(WIN + "_orig", label="Also save original Arnold frame as PNG", value=True)
+    cmds.checkBox(WIN + "_dbg", label="Save debug images (compare, change map, DLSS inputs) in output/debug", value=False)
     cmds.separator(height=6)
     cmds.button(WIN + "_go", label="Process Current Frame", height=32, command=_on_current)
     cmds.intFieldGrp(WIN + "_rng", label="Frame range", numberOfFields=2, value1=start, value2=end,
