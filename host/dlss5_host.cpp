@@ -20,6 +20,8 @@
 //   --fx-capture 0 capture post-Present instead of at reshade_finish_effects (the default capture
 //                  point is before ReShade's overlay/banner, so it never appears in the output)
 //   --per-frame N  presents per later frame before capturing (default 3)
+//   --passes N     neural passes per frame (1-5, default 1): each extra pass feeds the previous
+//                  DLSS 5 output back in as the colour input
 //   --near n       camera near clip used for reversed-Z (default 0.1)
 //   --exposure s   exposure in stops applied before sRGB encoding (default 0)
 //   --hdr 1        16-bit float scRGB back buffer (linear Rec.709, 1.0 = 80 nits); colour input is
@@ -316,6 +318,7 @@ int main(int argc, char** argv)
     const char* listPath = Arg(argc, argv, "--list", nullptr);
     const int   warmup   = atoi(Arg(argc, argv, "--warmup", "80"));
     const int   perFrame = std::max(1, atoi(Arg(argc, argv, "--per-frame", "3")));
+    const int   passes   = std::max(1, std::min(5, atoi(Arg(argc, argv, "--passes", "1"))));
     // Output is captured at reshade_finish_effects, before ReShade draws its startup banner, so
     // the warm-up no longer has to outlast the banner (test_fx_capture.py).
     const float warmupSec = (float)atof(Arg(argc, argv, "--warmup-sec", "1"));
@@ -559,6 +562,16 @@ int main(int argc, char** argv)
         if (j == 0) {
             const ULONGLONG until = startTick + (ULONGLONG)(warmupSec * 1000.f);
             while (ok && GetTickCount64() < until) if (!present()) ok = false;
+        }
+        if (!ok) break;
+        // Extra neural passes: feed this pass's DLSS 5 output (the reshade_finish_effects copy,
+        // same format and size as the colour texture) back in as the colour input and run again.
+        // Depth is unchanged; motion vectors are already zero for repeated presents of a frame.
+        for (int p = 1; p < passes && ok; ++p) {
+            if (!g_fxCopied) { fprintf(stderr, "[host] no DLSS output to feed back for pass %d\n", p + 1); break; }
+            ctx->CopyResource(colorTex, fxStaging);
+            for (int k = 0; k < std::max(perFrame, 2) && ok; ++k)
+                if (!present()) ok = false;
         }
         if (!ok) break;
         ok = capture(jobs[j].out.c_str());

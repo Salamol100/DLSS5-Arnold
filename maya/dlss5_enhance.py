@@ -567,7 +567,7 @@ def _write_debug(frame, name, out_dir, work, orig_view, dlss_view, depth_path, m
 
 def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep_original,
                   log, done, render_scene, use_mv=False, stabilise=0.0, hdr=True, space="ACEScg",
-                  aces=True, debug=False):
+                  aces=True, debug=False, passes=1):
     """frames: list of (frame, ass_or_None, exr, display_png_or_None).
     Runs kick (if ass), PFM, host, output. use_mv: pass Arnold's motionvector AOV (as exported by
     export_scene_frames(motion_vectors=True)) to DLSS 5. hdr: run DLSS 5 on a 16-bit float scRGB
@@ -640,7 +640,7 @@ def _run_pipeline(frames, out_dir, name, fmt, near, work, allow_flat_depth, keep
                     f.write("\t".join([j["c"], j["z"], j["out"]] + ([j["mv"]] if j["mv"] else [])) + "\n")
             log("DLSS 5: processing %d frame(s) (a window opens; leave it alone)" % len(batch))
             # One evaluation per new frame, as in a game.
-            args = [HOST, "--list", lst, "--near", "%g" % near, "--per-frame", "1"]
+            args = [HOST, "--list", lst, "--near", "%g" % near, "--per-frame", "1", "--passes", str(passes)]
             if hdr:
                 args += ["--hdr", "1"]
             elif display:
@@ -869,7 +869,7 @@ def _resolve_fmt(fmt, n_frames):
 
 def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt="auto",
                          keep_original=True, log=print, done=None, block=False, style=None,
-                         motion_vectors=None, stabilise=0.8, hdr=True, debug=False):
+                         motion_vectors=None, stabilise=0.8, hdr=True, debug=False, passes=1):
     """Render frames start..end of the open scene with Arnold, then DLSS 5 them in order.
     motion_vectors: None = automatic (on for ranges, off for a single frame).
     stabilise: 0 = off, else strength of the motion-vector stabilisation of the DLSS edit
@@ -886,7 +886,8 @@ def process_scene_frames(start, end, out_dir, intensity=0.5, structure=2.0, fmt=
     _start(_run_pipeline, dict(frames=frames, out_dir=out_dir, name=name, fmt=fmt, near=near, work=work,
                                allow_flat_depth=False, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=True, use_mv=use_mv,
-                               stabilise=stabilise, hdr=hdr, space=space, aces=aces, debug=debug), block)
+                               stabilise=stabilise, hdr=hdr, space=space, aces=aces, debug=debug,
+                               passes=passes), block)
 
 
 def find_sequence(one_file):
@@ -906,7 +907,7 @@ def find_sequence(one_file):
 
 def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, fmt="auto",
                          allow_flat_depth=False, keep_original=True, log=print, done=None, block=False,
-                         style=None, hdr=True, debug=False):
+                         style=None, hdr=True, debug=False, passes=1):
     """DLSS 5 an already-rendered EXR sequence: list of (frame, path). The EXRs are assumed to be
     in the scene's rendering space (ACEScg with Maya's default colour management)."""
     write_settings(intensity, structure, style)
@@ -918,7 +919,7 @@ def process_exr_sequence(exrs, out_dir, near=0.1, intensity=0.5, structure=2.0, 
     _start(_run_pipeline, dict(frames=frames, out_dir=out_dir, name=name, fmt=fmt, near=near, work=work,
                                allow_flat_depth=allow_flat_depth, keep_original=keep_original, log=log,
                                done=done or (lambda r, e: None), render_scene=False, hdr=hdr,
-                               space=space, aces=aces, debug=debug), block)
+                               space=space, aces=aces, debug=debug, passes=passes), block)
 
 
 def cancel():
@@ -971,6 +972,7 @@ def _ui_vals():
         fmt=_UI_FORMATS[cmds.optionMenuGrp(WIN + "_fmt", q=True, value=True)],
         keep_original=cmds.checkBox(WIN + "_orig", q=True, value=True),
         debug=cmds.checkBox(WIN + "_dbg", q=True, value=True),
+        passes=cmds.intSliderGrp(WIN + "_pas", q=True, value=True),
     )
 
 
@@ -1135,6 +1137,10 @@ def show():
                         value=intensity, precision=2, columnWidth3=(80, 50, 280))
     cmds.floatSliderGrp(WIN + "_str", label="Structure", field=True, minValue=0.0, maxValue=2.0,
                         value=structure, precision=2, columnWidth3=(80, 50, 280))
+    cmds.intSliderGrp(WIN + "_pas", label="Passes", field=True, minValue=1, maxValue=3, value=1,
+                      columnWidth3=(80, 50, 280),
+                      annotation="Run DLSS 5 again on its own output. 1 = normal, 2 = strong photoreal (sweet spot "
+                                 "on faces), 3 = overcooked: faces age and drift, environments soften more")
     cmds.optionMenuGrp(WIN + "_sty", label="Style", columnWidth2=(80, 100))
     for s in STYLES:
         cmds.menuItem(label=s)
